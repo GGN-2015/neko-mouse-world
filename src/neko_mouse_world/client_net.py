@@ -28,9 +28,11 @@ PLAYER_STATE_SEND_INTERVAL = 0.05
 class RemotePlayer:
     player_id: int
     pos: tuple[float, float, float]
+    velocity: tuple[float, float, float]
     heading: float
     pitch: float
     move_mode: str
+    received_at: float
 
 
 class NetworkWorldClient:
@@ -49,6 +51,7 @@ class NetworkWorldClient:
         self.player_id: int | None = None
         self.default_hash: str | None = None
         self.world_map = WorldMap()
+        self.server_logs: list[str] = []
         self.remote_players: dict[int, RemotePlayer] = {}
         self._remote_lock = threading.RLock()
         self.udp_host = host
@@ -134,9 +137,13 @@ class NetworkWorldClient:
     def send_rotate(self, cell: Cell, orientation: int) -> None:
         self._enqueue_tcp({"type": "rotate", "cell": list(cell), "orientation": orientation})
 
+    def send_server_command(self, command: str) -> None:
+        self._enqueue_tcp({"type": "server_command", "command": command})
+
     def send_player_state(
         self,
         pos: tuple[float, float, float],
+        velocity: tuple[float, float, float],
         heading: float,
         pitch: float,
         move_mode: str,
@@ -147,6 +154,7 @@ class NetworkWorldClient:
             "type": "player_state",
             "player_id": self.player_id,
             "pos": [pos[0], pos[1], pos[2]],
+            "velocity": [velocity[0], velocity[1], velocity[2]],
             "heading": heading,
             "pitch": pitch,
             "move_mode": move_mode,
@@ -343,6 +351,12 @@ class NetworkWorldClient:
         elif message_type == "player_state":
             self._apply_player_state(message)
             return
+        elif message_type == "server_log":
+            line = str(message.get("line", ""))
+            self.server_logs.append(line)
+            self.server_logs = self.server_logs[-300:]
+            self.incoming.put({"type": "server_log", "line": line})
+            return
         elif message_type == "player_left":
             try:
                 with self._remote_lock:
@@ -359,6 +373,12 @@ class NetworkWorldClient:
             self._store_asset(str(asset.get("hash", "")), str(asset.get("data", "")))
         if message.get("assets"):
             self._prefer_inline_startup_assets = False
+
+        logs = message.get("logs", [])
+        if isinstance(logs, list):
+            self.server_logs = [str(line) for line in logs][-300:]
+        else:
+            self.server_logs = []
 
         manifest = message.get("asset_manifest", [])
         missing_assets = self._missing_manifest_hashes(manifest)
@@ -643,14 +663,29 @@ class NetworkWorldClient:
         if player_id == self.player_id:
             return
         pos = message.get("pos", [0.0, 0.0, 0.0])
-        if not isinstance(pos, list | tuple) or len(pos) < 3:
+        if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+            return
+        velocity = message.get("velocity", [0.0, 0.0, 0.0])
+        if not isinstance(velocity, (list, tuple)):
+            velocity = [0.0, 0.0, 0.0]
+        velocity_values = list(velocity[:3])
+        while len(velocity_values) < 3:
+            velocity_values.append(0.0)
+        try:
+            pos_tuple = (float(pos[0]), float(pos[1]), float(pos[2]))
+            velocity_tuple = (float(velocity_values[0]), float(velocity_values[1]), float(velocity_values[2]))
+            heading = float(message.get("heading", 0.0))
+            pitch = float(message.get("pitch", 0.0))
+        except (TypeError, ValueError):
             return
         player = RemotePlayer(
             player_id=player_id,
-            pos=(float(pos[0]), float(pos[1]), float(pos[2])),
-            heading=float(message.get("heading", 0.0)),
-            pitch=float(message.get("pitch", 0.0)),
+            pos=pos_tuple,
+            velocity=velocity_tuple,
+            heading=heading,
+            pitch=pitch,
             move_mode=str(message.get("move_mode", "walk")),
+            received_at=time.monotonic(),
         )
         with self._remote_lock:
             self.remote_players[player_id] = player

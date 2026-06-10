@@ -44,6 +44,6 @@ def cell_to_list(cell: tuple[int, int, int]) -> list[int]:
 
 
 def list_to_cell(value: object) -> tuple[int, int, int]:
-    if not isinstance(value, list | tuple) or len(value) != 3:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise ValueError("cell must be a list of three integers")
     return (int(value[0]), int(value[1]), int(value[2]))

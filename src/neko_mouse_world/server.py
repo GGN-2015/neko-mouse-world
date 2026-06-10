@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import binascii
+from collections import deque
 from pathlib import Path
 import socketserver
 import json
@@ -27,6 +28,7 @@ DEFAULT_PORT = 5678
 UDP_PROBE_COUNT = 5
 UDP_PROBE_THRESHOLD = 3
 DEFAULT_STARTUP_ASSET_CHANNELS = 4
+SERVER_LOG_LIMIT = 300
 
 
 @dataclass
@@ -60,6 +62,7 @@ class WorldServerState:
         self.startup_asset_channels = DEFAULT_STARTUP_ASSET_CHANNELS
         self.lock = threading.RLock()
         self.next_player_id = 1
+        self.log_lines: deque[str] = deque(maxlen=SERVER_LOG_LIMIT)
 
     def configure_udp(self, host: str, port: int) -> None:
         with self.lock:
@@ -143,6 +146,7 @@ class WorldServerState:
                     for other_player_id, state in self.player_states.items()
                     if other_player_id != player_id
                 ],
+                "logs": list(self.log_lines),
             }
 
     def handle_asset_stream(self, message: dict[str, Any], writer: BinaryIO) -> None:
@@ -227,10 +231,25 @@ class WorldServerState:
                 self._handle_udp_probe_result(client, message)
             elif message_type == "player_state":
                 self._handle_tcp_player_state(client, message)
+            elif message_type == "server_command":
+                self._handle_server_command(client, message)
             else:
                 client.send({"type": "error", "message": f"unknown message type {message_type!r}"})
         except (TypeError, ValueError, WorldFormatError) as exc:
             client.send({"type": "error", "message": str(exc)})
+
+    def log(self, text: str) -> None:
+        line = str(text)
+        with self.lock:
+            self.log_lines.append(line)
+        print(line, flush=True)
+        self.broadcast({"type": "server_log", "line": line})
+
+    def _handle_server_command(self, client: ClientConnection, message: dict[str, Any]) -> None:
+        command = str(message.get("command", "")).strip()
+        if not command:
+            return
+        self.log(f"{client.player_id}: {command}")
 
     def _handle_place(self, client: ClientConnection, message: dict[str, Any]) -> None:
         cell = list_to_cell(message.get("cell"))
@@ -354,7 +373,7 @@ class WorldServerState:
                 except OSError:
                     pass
         if removed:
-            print(f"Removed {removed} unused .box files")
+            self.log(f"Removed {removed} unused .box files")
 
     def broadcast(self, message: dict[str, Any], exclude: int | None = None) -> None:
         with self.lock:
@@ -481,15 +500,32 @@ class WorldServerState:
 
     def _normalize_player_state(self, message: dict[str, Any]) -> dict[str, Any]:
         raw_pos = message.get("pos", [0.0, 0.0, 0.0])
-        if not isinstance(raw_pos, list | tuple):
+        if not isinstance(raw_pos, (list, tuple)):
             raw_pos = [0.0, 0.0, 0.0]
         pos_values = list(raw_pos[:3])
         while len(pos_values) < 3:
             pos_values.append(0.0)
+        raw_velocity = message.get("velocity", [0.0, 0.0, 0.0])
+        if not isinstance(raw_velocity, (list, tuple)):
+            raw_velocity = [0.0, 0.0, 0.0]
+        velocity_values = list(raw_velocity[:3])
+        while len(velocity_values) < 3:
+            velocity_values.append(0.0)
+        try:
+            pos = [float(value) for value in pos_values]
+            velocity = [float(value) for value in velocity_values]
+            heading = float(message.get("heading", 0.0))
+            pitch = float(message.get("pitch", 0.0))
+        except (TypeError, ValueError):
+            pos = [0.0, 0.0, 0.0]
+            velocity = [0.0, 0.0, 0.0]
+            heading = 0.0
+            pitch = 0.0
         return {
-            "pos": [float(value) for value in pos_values],
-            "heading": float(message.get("heading", 0.0)),
-            "pitch": float(message.get("pitch", 0.0)),
+            "pos": pos,
+            "velocity": velocity,
+            "heading": heading,
+            "pitch": pitch,
             "move_mode": str(message.get("move_mode", "walk")),
         }
 
@@ -593,16 +629,16 @@ def main(argv: list[str] | None = None) -> int:
         udp_loop.start()
         actual_host = str(server.server_address[0])
         actual_port = int(server.server_address[1])
-        print(f"Neko Mouse World server listening on {actual_host}:{actual_port}")
-        print(f"World TCP sync on {actual_host}:{actual_port}")
-        print(f"Player UDP candidate on {udp_host}:{udp_loop.port} (negotiated over TCP)")
-        print(f"World: {state.paths.root}")
+        state.log(f"Neko Mouse World server listening on {actual_host}:{actual_port}")
+        state.log(f"World TCP sync on {actual_host}:{actual_port}")
+        state.log(f"Player UDP candidate on {udp_host}:{udp_loop.port} (negotiated over TCP)")
+        state.log(f"World: {state.paths.root}")
         try:
             if args.with_client:
                 return _run_with_main_client(server, udp_loop, args.host, actual_port)
             server.serve_forever()
         except KeyboardInterrupt:
-            print("Shutting down")
+            state.log("Shutting down")
         finally:
             udp_loop.stop()
     return 0
@@ -626,12 +662,12 @@ def _run_with_main_client(
         "--port",
         str(port),
     ]
-    print(f"Launching main client on {client_host}:{port}")
+    server.state.log(f"Launching main client on {client_host}:{port}")
     try:
         client_process = subprocess.Popen(command)
         return_code = client_process.wait()
     except KeyboardInterrupt:
-        print("Shutting down")
+        server.state.log("Shutting down")
         return_code = 0
     finally:
         server.shutdown()

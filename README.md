@@ -120,6 +120,7 @@ is transparent, and alpha `255` is opaque.
 - `F2` or `Ctrl+S`: show save status; multiplayer worlds are saved by the server.
 - `F5`: switch first-person / third-person view.
 - `C`: look at the world-box centroid, or the origin when the world is empty.
+- `~`: open the server command console.
 - `H`: show help.
 - `Esc`: release the mouse and show exit choices.
 
