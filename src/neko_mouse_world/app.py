@@ -56,7 +56,7 @@ from .box_mesh import (
 from .client_net import NetworkWorldClient, RemotePlayer
 from .collision import CollisionShapeCache
 from .net_protocol import list_to_cell
-from .orientation import IDENTITY_ORIENTATION, nearest_axis, rotate_point, turn_orientation_around_axis
+from .orientation import IDENTITY_ORIENTATION, nearest_axis, rotate_normal, rotate_point, turn_orientation_around_axis
 from .world_file import Cell, LoadedWorld, WorldFormatError, WorldMap, save_world
 
 
@@ -85,6 +85,7 @@ POINT_LIGHT_MAX_DISTANCE = 34.0
 POINT_LIGHT_ALWAYS_DISTANCE = 5.0
 POINT_LIGHT_VIEW_DOT_MIN = math.cos(math.radians(min(89.0, CAMERA_FOV * 0.5 + 20.0)))
 MAX_ACTIVE_POINT_LIGHTS = 24
+POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL = 0.08
 MOVE_SPEED = 5.2
 FLY_VERTICAL_SPEED = 4.4
 MOUSE_SENSITIVITY = 0.055
@@ -188,6 +189,7 @@ class NekoMouseWorldApp(ShowBase):
         self.box_light_candidates: dict[Cell, tuple[_BoxLightCandidate, ...]] = {}
         self.active_box_lights: dict[tuple[Cell, int], NodePath] = {}
         self.next_point_light_update = 0.0
+        self.next_point_light_prune = 0.0
         self.hover_outline = make_cube_outline()
         self.hover_outline.reparentTo(self.world)
         self.hover_outline.hide()
@@ -1951,6 +1953,7 @@ class NekoMouseWorldApp(ShowBase):
         self.active_box_lights.clear()
         self.box_light_candidates.clear()
         self.next_point_light_update = 0.0
+        self.next_point_light_prune = 0.0
 
     def _clear_box_lights_for_chunk(self, key: ChunkKey) -> None:
         for cell in [cell for cell in self.box_light_candidates if chunk_key_for_cell(cell) == key]:
@@ -1965,10 +1968,13 @@ class NekoMouseWorldApp(ShowBase):
     def _update_visible_box_lights(self, force: bool = False) -> None:
         now = globalClock.getFrameTime()
         if not force and not self._player_input_is_idle():
+            self._prune_occluded_active_box_lights(now)
             return
         if not force and now < self.next_point_light_update:
+            self._prune_occluded_active_box_lights(now)
             return
         self.next_point_light_update = now + POINT_LIGHT_UPDATE_INTERVAL
+        self.next_point_light_prune = now + POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL
         desired = self._desired_box_light_keys()
         for key in [key for key in self.active_box_lights if key not in desired]:
             self._remove_box_light(self.active_box_lights.pop(key))
@@ -1977,6 +1983,19 @@ class NekoMouseWorldApp(ShowBase):
                 continue
             candidate = self.box_light_candidates[key[0]][key[1]]
             self.active_box_lights[key] = self._create_box_light(key, candidate)
+
+    def _prune_occluded_active_box_lights(self, now: float) -> None:
+        if now < self.next_point_light_prune:
+            return
+        self.next_point_light_prune = now + POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL
+        camera_pos = self.camera.getPos(self.render)
+        for key in list(self.active_box_lights):
+            candidate = self.box_light_candidates.get(key[0], ())
+            if key[1] >= len(candidate):
+                self._remove_box_light(self.active_box_lights.pop(key))
+                continue
+            if self._is_box_light_occluded(camera_pos, candidate[key[1]].position, key[0]):
+                self._remove_box_light(self.active_box_lights.pop(key))
 
     def _desired_box_light_keys(self) -> set[tuple[Cell, int]]:
         scored: list[tuple[float, Cell, int]] = []
@@ -1996,11 +2015,85 @@ class NekoMouseWorldApp(ShowBase):
                 view_dot = (dx * camera_forward.x + dy * camera_forward.y + dz * camera_forward.z) / distance
                 if distance_sq > always_distance_sq and view_dot < POINT_LIGHT_VIEW_DOT_MIN:
                     continue
+                if self._is_box_light_occluded(camera_pos, candidate.position, cell):
+                    continue
                 brightness = max(candidate.color[0], candidate.color[1], candidate.color[2])
                 score = brightness * 100.0 + view_dot * 8.0 - distance
                 scored.append((score, cell, index))
         scored.sort(reverse=True)
         return {(cell, index) for _score, cell, index in scored[:MAX_ACTIVE_POINT_LIGHTS]}
+
+    def _is_box_light_occluded(self, camera_pos: Point3 | Vec3, light_pos: tuple[float, float, float], light_cell: Cell) -> bool:
+        origin = Point3(camera_pos)
+        target = Point3(*light_pos)
+        direction = target - origin
+        total_distance = direction.length()
+        if total_distance <= 1e-5:
+            return False
+        direction /= total_distance
+
+        cell = [
+            math.floor(origin.x),
+            math.floor(origin.y),
+            math.floor(origin.z),
+        ]
+        steps: list[int] = []
+        next_distances: list[float] = []
+        delta_distances: list[float] = []
+        for axis in range(3):
+            component = direction[axis]
+            origin_value = origin[axis]
+            if component > 0:
+                steps.append(1)
+                next_boundary = cell[axis] + 1.0
+                next_distances.append((next_boundary - origin_value) / component)
+                delta_distances.append(1.0 / component)
+            elif component < 0:
+                steps.append(-1)
+                next_boundary = float(cell[axis])
+                next_distances.append((next_boundary - origin_value) / component)
+                delta_distances.append(-1.0 / component)
+            else:
+                steps.append(0)
+                next_distances.append(math.inf)
+                delta_distances.append(math.inf)
+
+        distance = 0.0
+        entry_normal = (0, 0, 0)
+        max_steps = int(total_distance * 3.0) + 8
+        for _ in range(max_steps):
+            current = (cell[0], cell[1], cell[2])
+            if distance > total_distance:
+                return False
+            if current != light_cell and self._cell_blocks_box_light(current, entry_normal):
+                return True
+
+            axis = min(range(3), key=lambda index: next_distances[index])
+            distance = next_distances[axis]
+            if distance > total_distance:
+                return False
+            cell[axis] += steps[axis]
+            normal = [0, 0, 0]
+            normal[axis] = -steps[axis]
+            entry_normal = (normal[0], normal[1], normal[2])
+            next_distances[axis] += delta_distances[axis]
+        return False
+
+    def _cell_blocks_box_light(self, cell: Cell, entry_normal: Cell) -> bool:
+        digest = self.world_map.get_box(cell)
+        if digest is None:
+            return False
+        try:
+            surface = self.surface_cache.get(digest)
+        except BoxFormatError:
+            return False
+        orientation = self.world_map.get_orientation(cell)
+        blocking_faces = {rotate_normal(face, orientation) for face in surface.opaque_boundary_faces}
+        if not blocking_faces:
+            return False
+        if entry_normal == (0, 0, 0):
+            return True
+        return entry_normal in blocking_faces
 
     def _create_box_light(self, key: tuple[Cell, int], candidate: _BoxLightCandidate) -> NodePath:
         cell, index = key
