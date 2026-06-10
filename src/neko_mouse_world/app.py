@@ -167,6 +167,7 @@ class NekoMouseWorldApp(ShowBase):
         self.server_initial_load_progress_used = network_client is None and not show_connect_dialog
         self.default_hash = network_client.default_hash if network_client and network_client.default_hash else ensure_default_box(self.paths.boxes_dir)
         self.selected_hash = self.default_hash
+        self.selected_orientation = IDENTITY_ORIENTATION
         self.saved_snapshot = "" if network_client is not None else self._current_world_snapshot()
         self.gpu_profile: GpuProfile = detect_gpu_profile(self.win.getGsg() if self.win else None)
         self._startup_window_maximize_attempted = False
@@ -566,6 +567,7 @@ class NekoMouseWorldApp(ShowBase):
                 self.dirty_chunk_queue.clear()
                 self.default_hash = self.network_client.default_hash or self.default_hash
                 self.selected_hash = self.default_hash
+                self.selected_orientation = IDENTITY_ORIENTATION
                 self.world_map = self.network_client.world_map
                 self.saved_snapshot = ""
                 self._hide_disconnect_panel()
@@ -953,7 +955,7 @@ class NekoMouseWorldApp(ShowBase):
         if now < self.next_hud_update:
             return
         self.next_hud_update = now + HUD_UPDATE_INTERVAL
-        selected = self.selected_hash[:12]
+        selected = f"{self.selected_hash[:12]}@{self.selected_orientation}"
         target = "none"
         if self.hovered_cell is not None:
             digest = self.world_map.get_box(self.hovered_cell)
@@ -1022,9 +1024,9 @@ class NekoMouseWorldApp(ShowBase):
             return
         if self._block_intersects_player(target):
             return
-        self._set_world_box(target, self.selected_hash)
+        self._set_world_box_with_orientation(target, self.selected_hash, self.selected_orientation)
         self.place_sound.play()
-        self._set_status(f"Placed {target}")
+        self._set_status(f"Placed {target} orientation={self.selected_orientation}")
 
     def _delete_clicked_box(self) -> None:
         self._mark_player_input_active()
@@ -1079,7 +1081,8 @@ class NekoMouseWorldApp(ShowBase):
         if digest is None:
             return
         self.selected_hash = digest
-        self._set_status(f"Selected {digest[:12]}")
+        self.selected_orientation = self.world_map.get_orientation(cell)
+        self._set_status(f"Selected {digest[:12]} orientation={self.selected_orientation}")
 
     def _rotate_target_box(self, command: str) -> None:
         self._mark_player_input_active()
@@ -1256,11 +1259,12 @@ class NekoMouseWorldApp(ShowBase):
             self.surface_cache.invalidate(new_digest)
             self.collision_cache.invalidate(new_digest)
             self.selected_hash = new_digest
+            self.selected_orientation = self.world_map.get_orientation(cell)
             if new_digest != digest:
-                self._set_world_box(cell, new_digest)
-                self._set_status(f"Updated {cell} -> {new_digest[:12]}")
+                self._set_world_box_with_orientation(cell, new_digest, self.selected_orientation)
+                self._set_status(f"Updated {cell} -> {new_digest[:12]} orientation={self.selected_orientation}")
             else:
-                self._set_status(f"Selected edited box {new_digest[:12]}")
+                self._set_status(f"Selected edited box {new_digest[:12]} orientation={self.selected_orientation}")
         finally:
             if tempdir is not None:
                 tempdir.cleanup()
@@ -2186,7 +2190,7 @@ class NekoMouseWorldApp(ShowBase):
                     "Right click: place selected box",
                     "Left click: delete target box",
                     "Z: restore the last box you deleted",
-                    "Middle click: select target box type",
+                    "Middle click: select target box and orientation",
                     "E: edit target box with box-editor-view",
                     "Alpha 0 in .box: opaque RGB light source",
                     "F2 or Ctrl+S: show save status",
@@ -2716,7 +2720,7 @@ class NekoMouseWorldApp(ShowBase):
         temporary = False
         if digest is None:
             digest = self.selected_hash
-            self.world_map.set_box(cell, digest, IDENTITY_ORIENTATION)
+            self.world_map.set_box(cell, digest, self.selected_orientation)
             temporary = True
         try:
             return self._blocking_top_for_player(self.player_pos) is not None

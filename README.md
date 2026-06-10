@@ -113,7 +113,7 @@ is transparent, and alpha `255` is opaque.
 - Right click: place the selected `.box`.
 - Left click: delete the targeted world box.
 - `Z`: restore the last world box you deleted.
-- Middle click: select the targeted world box type.
+- Middle click: select the targeted world box type and orientation.
 - `E`: edit the targeted world box in `box-editor-view`.
 - Numpad `4` / `6`: rotate the targeted box around the player's view-up axis.
 - Numpad `8` / `2`: rotate the targeted box around the player's view direction axis.
