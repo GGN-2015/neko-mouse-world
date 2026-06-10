@@ -17,13 +17,13 @@ from panda3d.core import (
 
 from box_editor_view.box_file import BoxMap, RGBA, load_box
 from box_editor_view.geometry import FaceNormal
-from box_editor_view.voxel_mesh import visible_faces_for_cell
+from box_editor_view.voxel_mesh import is_light_color, is_transparent_color, render_rgba, visible_faces_for_cell
 
 from .orientation import IDENTITY_ORIENTATION, rotate_normal, rotate_outer_face, rotate_point
 from .world_file import Cell, box_path_for_hash
 
 
-WORLD_CHUNK_SIZE = 16
+WORLD_CHUNK_SIZE = 1
 FACE_NORMALS: tuple[FaceNormal, ...] = (
     (1, 0, 0),
     (-1, 0, 0),
@@ -36,6 +36,7 @@ OPAQUE_OCCUPANCY_THRESHOLD = 0.999
 
 ChunkKey = tuple[int, int, int]
 Quad = tuple[FaceNormal, tuple[tuple[float, float, float], ...], RGBA, FaceNormal | None]
+LightPoint = tuple[tuple[float, float, float], RGBA]
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class BoxSurface:
     opaque_quads: tuple[Quad, ...]
     transparent_quads: tuple[Quad, ...]
     opaque_boundary_faces: frozenset[FaceNormal]
+    light_points: tuple[LightPoint, ...]
     blocks: int
 
 
@@ -140,7 +142,7 @@ def build_box_surface(box_map: BoxMap) -> BoxSurface:
         visible = visible_faces_for_cell(cell, color, box_map.boxes)
         for normal in visible:
             plane, u, v = _face_plane_uv(cell, normal)
-            transparent = color[3] < 1.0
+            transparent = is_transparent_color(color)
             groups.setdefault((transparent, normal, plane, color), set()).add((u, v))
 
     opaque_quads: list[Quad] = []
@@ -152,7 +154,7 @@ def build_box_surface(box_map: BoxMap) -> BoxSurface:
                 (
                     normal,
                     _scaled_quad_vertices(normal, plane, u0, v0, u1, v1, unit),
-                    color,
+                    render_rgba(color),
                     _outer_face_for_plane(normal, plane, box_map.size),
                 )
             )
@@ -161,6 +163,7 @@ def build_box_surface(box_map: BoxMap) -> BoxSurface:
         opaque_quads=tuple(opaque_quads),
         transparent_quads=tuple(transparent_quads),
         opaque_boundary_faces=_opaque_full_boundary_faces(box_map),
+        light_points=_light_points(box_map),
         blocks=len(box_map.boxes),
     )
 
@@ -255,7 +258,7 @@ def _rotate_vertices(vertices: tuple[tuple[float, float, float], ...], orientati
 
 
 def _opaque_full_boundary_faces(box_map: BoxMap) -> frozenset[FaceNormal]:
-    opaque_cells = {cell for cell, color in box_map.boxes.items() if color[3] >= OPAQUE_OCCUPANCY_THRESHOLD}
+    opaque_cells = {cell for cell, color in box_map.boxes.items() if _is_occluding_color(color)}
     size = box_map.size
     faces: set[FaceNormal] = set()
 
@@ -276,6 +279,19 @@ def _opaque_full_boundary_faces(box_map: BoxMap) -> frozenset[FaceNormal]:
 
 def _full_plane(opaque_cells: set[Cell], cells: Iterable[Cell]) -> bool:
     return all(cell in opaque_cells for cell in cells)
+
+
+def _is_occluding_color(color: RGBA) -> bool:
+    return color[3] >= OPAQUE_OCCUPANCY_THRESHOLD or color[3] <= 0.0
+
+
+def _light_points(box_map: BoxMap) -> tuple[LightPoint, ...]:
+    scale = 1.0 / float(box_map.size)
+    points: list[LightPoint] = []
+    for (x, y, z), color in sorted(box_map.boxes.items()):
+        if is_light_color(color):
+            points.append((((x + 0.5) * scale, (y + 0.5) * scale, (z + 0.5) * scale), render_rgba(color)))
+    return tuple(points)
 
 
 def _outer_face_for_plane(normal: FaceNormal, plane: int, size: int) -> FaceNormal | None:

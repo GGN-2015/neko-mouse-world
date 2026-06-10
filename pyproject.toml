@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "GGN_2015" }]
 dependencies = [
-    "box-editor-view>=0.1.5",
+    "box-editor-view>=0.1.7",
     "panda3d>=1.10.14",
 ]
 

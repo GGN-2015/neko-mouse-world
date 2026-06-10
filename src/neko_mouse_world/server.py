@@ -26,13 +26,17 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5678
 UDP_PROBE_COUNT = 5
 UDP_PROBE_THRESHOLD = 3
+DEFAULT_STARTUP_ASSET_CHANNELS = 4
 
 
 @dataclass
 class ClientConnection:
     player_id: int
+    client_uuid: str
     writer: BinaryIO
     lock: threading.Lock = field(default_factory=threading.Lock)
+    startup_token: str = field(default_factory=lambda: secrets.token_hex(16))
+    startup_asset_hashes: set[str] = field(default_factory=set)
     udp_token: str = field(default_factory=lambda: secrets.token_hex(16))
     udp_address: tuple[str, int] | None = None
     udp_enabled: bool = False
@@ -53,6 +57,7 @@ class WorldServerState:
         self.player_states: dict[int, dict[str, Any]] = {}
         self.udp_host = DEFAULT_HOST
         self.udp_port = 0
+        self.startup_asset_channels = DEFAULT_STARTUP_ASSET_CHANNELS
         self.lock = threading.RLock()
         self.next_player_id = 1
 
@@ -61,33 +66,64 @@ class WorldServerState:
             self.udp_host = host
             self.udp_port = port
 
-    def register(self, writer: BinaryIO) -> ClientConnection:
+    def configure_startup_asset_channels(self, channels: int) -> None:
+        with self.lock:
+            self.startup_asset_channels = max(1, min(int(channels), 16))
+
+    def register(self, writer: BinaryIO, client_uuid: str) -> ClientConnection:
         with self.lock:
             player_id = self.next_player_id
             self.next_player_id += 1
-            client = ClientConnection(player_id=player_id, writer=writer)
+            client = ClientConnection(player_id=player_id, client_uuid=client_uuid, writer=writer)
             self.clients[player_id] = client
             return client
 
     def unregister(self, client: ClientConnection) -> None:
+        should_cleanup = False
         with self.lock:
             self.clients.pop(client.player_id, None)
             self.player_states.pop(client.player_id, None)
+            should_cleanup = not self.clients
+        try:
+            client.writer.close()
+        except OSError:
+            pass
         self.broadcast({"type": "player_left", "player_id": client.player_id}, exclude=client.player_id)
+        if should_cleanup:
+            self._cleanup_unused_boxes()
 
-    def welcome_message(self, player_id: int) -> dict[str, Any]:
+    def welcome_message(self, player_id: int, include_assets: bool = False) -> dict[str, Any]:
         with self.lock:
+            client = self.clients[player_id]
             hashes = sorted({self.default_hash, *self.world_map.boxes.values()})
-            assets = [
-                {"hash": digest, "data": encode_file_base64(box_path_for_hash(self.paths.boxes_dir, digest))}
+            existing_hashes = [
+                digest
                 for digest in hashes
                 if box_path_for_hash(self.paths.boxes_dir, digest).is_file()
             ]
+            client.startup_asset_hashes = set(existing_hashes)
+            asset_manifest = [
+                {
+                    "hash": digest,
+                    "size": box_path_for_hash(self.paths.boxes_dir, digest).stat().st_size,
+                }
+                for digest in existing_hashes
+            ]
+            assets = []
+            if include_assets:
+                assets = [
+                    {"hash": digest, "data": encode_file_base64(box_path_for_hash(self.paths.boxes_dir, digest))}
+                    for digest in existing_hashes
+                ]
             return {
                 "type": "welcome",
-                "protocol": 1,
+                "protocol": 2,
                 "player_id": player_id,
                 "default_hash": self.default_hash,
+                "client_uuid": client.client_uuid,
+                "startup_token": client.startup_token,
+                "startup_asset_channels": client.startup_asset_hashes and self.startup_asset_channels or 1,
+                "asset_manifest": asset_manifest,
                 "udp_host": self.udp_host,
                 "udp_port": self.udp_port,
                 "udp_probe_token": self.clients[player_id].udp_token,
@@ -108,6 +144,70 @@ class WorldServerState:
                     if other_player_id != player_id
                 ],
             }
+
+    def handle_asset_stream(self, message: dict[str, Any], writer: BinaryIO) -> None:
+        try:
+            player_id = int(message.get("player_id"))
+            client_uuid = str(message.get("client_uuid", ""))
+            token = str(message.get("startup_token", ""))
+            raw_hashes = message.get("hashes", [])
+            if not isinstance(raw_hashes, list):
+                raise ValueError("hashes must be a list")
+            hashes = [str(digest) for digest in raw_hashes]
+            raw_stream = bool(message.get("raw"))
+        except (TypeError, ValueError):
+            return
+
+        with self.lock:
+            client = self.clients.get(player_id)
+            if client is None or client.client_uuid != client_uuid or client.startup_token != token:
+                return
+            allowed_hashes = {self.default_hash, *self.world_map.boxes.values(), *client.startup_asset_hashes}
+
+        for digest in hashes:
+            if digest not in allowed_hashes:
+                self._send_asset_stream_error(writer, f"asset {digest} is not available for this startup stream")
+                return
+            path = box_path_for_hash(self.paths.boxes_dir, digest)
+            if not path.is_file():
+                self._send_asset_stream_error(writer, f"asset {digest} is missing")
+                return
+            with self.lock:
+                current = self.clients.get(player_id)
+                if current is None or current.client_uuid != client_uuid or current.startup_token != token:
+                    return
+            if raw_stream:
+                if not self._send_asset_stream_raw(writer, digest, path):
+                    return
+            else:
+                try:
+                    send_message(writer, {"type": "asset", "hash": digest, "data": encode_file_base64(path)})
+                except OSError:
+                    return
+        try:
+            send_message(writer, {"type": "asset_stream_done"})
+        except OSError:
+            return
+
+    def _send_asset_stream_raw(self, writer: BinaryIO, digest: str, path: Path) -> bool:
+        try:
+            send_message(writer, {"type": "asset_raw", "hash": digest, "size": path.stat().st_size})
+            with path.open("rb") as source:
+                while True:
+                    chunk = source.read(1024 * 256)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+            writer.flush()
+            return True
+        except OSError:
+            return False
+
+    def _send_asset_stream_error(self, writer: BinaryIO, message: str) -> None:
+        try:
+            send_message(writer, {"type": "error", "message": message})
+        except OSError:
+            return
 
     def handle_message(self, client: ClientConnection, message: dict[str, Any]) -> None:
         try:
@@ -138,9 +238,11 @@ class WorldServerState:
         orientation = validate_orientation(message.get("orientation", IDENTITY_ORIENTATION))
         with self.lock:
             if cell in self.world_map.boxes:
+                self._send_cell_state(client, cell)
                 return
             if not self._ensure_asset(digest, message.get("asset")):
                 client.send({"type": "error", "message": f"missing asset {digest}"})
+                self._send_cell_state(client, cell)
                 return
             self.world_map.set_box(cell, digest, orientation)
             self._save()
@@ -152,10 +254,12 @@ class WorldServerState:
         digest = str(message.get("hash", ""))
         with self.lock:
             if cell not in self.world_map.boxes:
+                self._send_cell_state(client, cell)
                 return
             orientation = validate_orientation(message.get("orientation", self.world_map.get_orientation(cell)))
             if not self._ensure_asset(digest, message.get("asset")):
                 client.send({"type": "error", "message": f"missing asset {digest}"})
+                self._send_cell_state(client, cell)
                 return
             self.world_map.set_box(cell, digest, orientation)
             self._save()
@@ -171,11 +275,12 @@ class WorldServerState:
         if removed:
             self.broadcast({"type": "box_removed", "cell": cell_to_list(cell)})
 
-    def _handle_rotate(self, _client: ClientConnection, message: dict[str, Any]) -> None:
+    def _handle_rotate(self, client: ClientConnection, message: dict[str, Any]) -> None:
         cell = list_to_cell(message.get("cell"))
         orientation = validate_orientation(message.get("orientation", IDENTITY_ORIENTATION))
         with self.lock:
             if cell not in self.world_map.boxes:
+                self._send_cell_state(client, cell)
                 return
             self.world_map.set_orientation(cell, orientation)
             digest = self.world_map.get_box(cell)
@@ -213,7 +318,7 @@ class WorldServerState:
     def _broadcast_asset_if_present(self, digest: str) -> None:
         path = box_path_for_hash(self.paths.boxes_dir, digest)
         if path.is_file():
-            self.broadcast({"type": "asset", "hash": digest, "data": encode_file_base64(path)})
+            self.broadcast({"type": "asset", "hash": digest, "size": path.stat().st_size})
 
     def _box_set_message(self, cell: Cell, digest: str, orientation: int) -> dict[str, Any]:
         return {
@@ -223,8 +328,33 @@ class WorldServerState:
             "orientation": orientation,
         }
 
+    def _send_cell_state(self, client: ClientConnection, cell: Cell) -> None:
+        digest = self.world_map.get_box(cell)
+        try:
+            if digest is None:
+                client.send({"type": "box_removed", "cell": cell_to_list(cell)})
+            else:
+                client.send(self._box_set_message(cell, digest, self.world_map.get_orientation(cell)))
+        except OSError:
+            pass
+
     def _save(self) -> None:
         save_world(self.paths.info_file, self.world_map)
+
+    def _cleanup_unused_boxes(self) -> None:
+        with self.lock:
+            used = {self.default_hash, *self.world_map.boxes.values()}
+            self._save()
+        removed = 0
+        for path in self.paths.boxes_dir.glob("*.box"):
+            if path.stem not in used:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            print(f"Removed {removed} unused .box files")
 
     def broadcast(self, message: dict[str, Any], exclude: int | None = None) -> None:
         with self.lock:
@@ -406,12 +536,17 @@ class _ThreadingServer(socketserver.ThreadingTCPServer):
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         state: WorldServerState = self.server.state  # type: ignore[attr-defined]
-        client = state.register(self.wfile)
+        client: ClientConnection | None = None
         try:
             first = read_message(self.rfile)
-            if first and first.get("type") == "hello":
-                pass
-            client.send(state.welcome_message(client.player_id))
+            if first is not None and first.get("type") == "asset_stream":
+                state.handle_asset_stream(first, self.wfile)
+                return
+
+            client_uuid = str((first or {}).get("client_uuid", "")) or secrets.token_hex(16)
+            client = state.register(self.wfile, client_uuid)
+            include_assets = bool((first or {}).get("include_assets", False))
+            client.send(state.welcome_message(client.player_id, include_assets=include_assets))
             state.broadcast({"type": "player_join", "player_id": client.player_id}, exclude=client.player_id)
             while True:
                 message = read_message(self.rfile)
@@ -421,7 +556,8 @@ class _Handler(socketserver.StreamRequestHandler):
         except (ConnectionError, OSError, ValueError):
             pass
         finally:
-            state.unregister(client)
+            if client is not None:
+                state.unregister(client)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -431,6 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="TCP port to bind")
     parser.add_argument("--udp-host", default=None, help="UDP host/interface to bind; defaults to --host")
     parser.add_argument("--udp-port", default=0, type=int, help="UDP port to bind; 0 auto-allocates")
+    parser.add_argument(
+        "--startup-asset-channels",
+        default=DEFAULT_STARTUP_ASSET_CHANNELS,
+        type=int,
+        help="temporary TCP channels per client for startup .box asset transfer",
+    )
     parser.add_argument("--with-client", action="store_true", help="also launch a main local client and stop when it exits")
     return parser
 
@@ -443,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     except WorldFormatError as exc:
         print(f"FormatError: {exc}")
         return 1
+    state.configure_startup_asset_channels(args.startup_asset_channels)
 
     udp_host = args.udp_host or args.host
     with _ThreadingServer((args.host, args.port), _Handler, state) as server:
