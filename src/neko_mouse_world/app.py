@@ -102,7 +102,6 @@ GROUND_CHUNKS_PER_FRAME = 2
 HUD_UPDATE_INTERVAL = 0.10
 SOUND_VOLUME = 0.5
 CLOSE_REQUEST_EVENT = "neko-mouse-world-close-request"
-STARTUP_MAXIMIZE_FRAMES = 30
 WORLD_LOAD_TASK_NAME = "neko-mouse-world-load"
 WORLD_LOAD_FRAME_BUDGET = 0.012
 NETWORK_POLL_MESSAGE_BUDGET = 64
@@ -170,7 +169,8 @@ class NekoMouseWorldApp(ShowBase):
         self.selected_hash = self.default_hash
         self.saved_snapshot = "" if network_client is not None else self._current_world_snapshot()
         self.gpu_profile: GpuProfile = detect_gpu_profile(self.win.getGsg() if self.win else None)
-        self.window_maximized = maximize_window(self.win)
+        self._startup_window_maximize_attempted = False
+        self._maximize_startup_window_once()
         self.ime_disabled = disable_ime_for_window(self.win)
 
         self.world = self.render.attachNewNode("world")
@@ -238,7 +238,6 @@ class NekoMouseWorldApp(ShowBase):
         self.quit_button_frames: dict[str, DirectFrame] = {}
         self.quit_buttons: dict[str, DirectButton] = {}
         self.active_quit_choice = "cancel"
-        self.startup_maximize_frames = STARTUP_MAXIMIZE_FRAMES
         self.removed_missing_refs = loaded_world.removed_missing_refs
         self.remote_player_nodes: dict[int, NodePath] = {}
         self.last_udp_player_state = 0.0
@@ -520,7 +519,6 @@ class NekoMouseWorldApp(ShowBase):
 
     def _update(self, task):
         dt = min(globalClock.getDt(), 0.05)
-        self._keep_startup_window_maximized()
         self._check_foreground_pause()
         loading = self.world_load_job is not None
         focus_paused = self.modal_mode == "focus_pause"
@@ -645,11 +643,11 @@ class NekoMouseWorldApp(ShowBase):
         self.last_remote_player_sync = now
         self._sync_remote_players()
 
-    def _keep_startup_window_maximized(self) -> None:
-        if self.startup_maximize_frames <= 0:
+    def _maximize_startup_window_once(self) -> None:
+        if self._startup_window_maximize_attempted:
             return
-        self.window_maximized = maximize_window(self.win) or self.window_maximized
-        self.startup_maximize_frames -= 1
+        self._startup_window_maximize_attempted = True
+        maximize_window(self.win)
 
     def _update_mouse_look(self) -> None:
         if not self.win or not hasattr(self.win, "getPointer"):
@@ -2492,7 +2490,6 @@ class NekoMouseWorldApp(ShowBase):
         if hasattr(self.win, "requestProperties"):
             self.win.requestProperties(props)
         if captured:
-            self.window_maximized = maximize_window(self.win) or self.window_maximized
             self._center_pointer()
             self.crosshair.show()
         else:
