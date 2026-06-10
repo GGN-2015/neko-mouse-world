@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+import tempfile
+
+from .app import NekoMouseWorldApp
+from .client_net import NetworkWorldClient
+from .server import DEFAULT_HOST, DEFAULT_PORT
+from .world_file import LoadedWorld, WorldMap, world_paths
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Neko Mouse World multiplayer client")
+    parser.add_argument("--host", default=None, help="server TCP host")
+    parser.add_argument("--port", default=None, type=int, help="server TCP port")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_args)
+    prompt_for_connection = args.host is None and args.port is None
+
+    app: NekoMouseWorldApp | None = None
+    network_client: NetworkWorldClient | None = None
+    try:
+        if prompt_for_connection:
+            cache_root = Path(tempfile.gettempdir()) / "neko_mouse_world_client_pending"
+            paths = world_paths(cache_root)
+            paths.root.mkdir(parents=True, exist_ok=True)
+            paths.boxes_dir.mkdir(parents=True, exist_ok=True)
+            loaded_world = LoadedWorld(paths=paths, world_map=WorldMap())
+            app = NekoMouseWorldApp(
+                loaded_world,
+                show_connect_dialog=True,
+                default_connect_host=DEFAULT_HOST,
+                default_connect_port=DEFAULT_PORT,
+            )
+        else:
+            host = args.host or DEFAULT_HOST
+            port = args.port if args.port is not None else DEFAULT_PORT
+            network_client = NetworkWorldClient(host, port)
+            loaded_world = LoadedWorld(paths=network_client.paths, world_map=network_client.world_map)
+            app = NekoMouseWorldApp(loaded_world, network_client=network_client)
+        app.run()
+    finally:
+        if app and app.network_client is not None:
+            app.network_client.close()
+        elif network_client is not None:
+            network_client.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

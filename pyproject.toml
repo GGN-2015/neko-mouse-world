@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neko-mouse-world"
+version = "0.1.0"
+description = "Panda3D voxel world editor built from reusable .box assets."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "GGN_2015" }]
+dependencies = [
+    "box-editor-view>=0.1.5",
+    "panda3d>=1.10.14",
+]
+
+[project.scripts]
+neko-mouse-world = "neko_mouse_world.client:main"
+neko-mouse-world-client = "neko_mouse_world.client:main"
+neko-mouse-world-server = "neko_mouse_world.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
