@@ -103,6 +103,9 @@ class NetworkWorldClient:
 
         self._sock: socket.socket | None = None
         self._send_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._send_condition = threading.Condition()
+        self._send_pending = 0
+        self._send_failed = 0
         self._latest_player_state: dict[str, Any] | None = None
         self._latest_player_state_lock = threading.Lock()
         self._startup_asset_lock = threading.Lock()
@@ -235,6 +238,9 @@ class NetworkWorldClient:
 
     def send_rotate(self, cell: Cell, orientation: int) -> None:
         self._enqueue_tcp({"type": "rotate", "cell": list(cell), "orientation": orientation})
+
+    def send_asset(self, digest: str) -> None:
+        self._enqueue_tcp({"type": "asset", "hash": str(digest or ""), "_attach_asset": True})
 
     def send_server_command(self, command: str) -> None:
         self._enqueue_tcp({"type": "server_command", "command": command})
@@ -487,7 +493,7 @@ class NetworkWorldClient:
             except queue.Empty:
                 message = None
             if message is not None:
-                self._send_tcp_now(message)
+                self._send_tcp_now(message, track_pending=True)
                 sent_work = True
 
             now = time.monotonic()
@@ -1030,7 +1036,27 @@ class NetworkWorldClient:
     def _enqueue_tcp(self, message: dict[str, Any]) -> None:
         if self._stop.is_set():
             return
+        with self._send_condition:
+            self._send_pending += 1
         self._send_queue.put(message)
+
+    def wait_for_pending_sends(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._send_condition:
+            while self._send_pending > 0 and not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._send_condition.wait(min(0.1, remaining))
+            return self._send_pending <= 0
+
+    def pending_send_count(self) -> int:
+        with self._send_condition:
+            return self._send_pending
+
+    def failed_send_count(self) -> int:
+        with self._send_condition:
+            return self._send_failed
 
     def _take_latest_player_state(self) -> dict[str, Any] | None:
         with self._latest_player_state_lock:
@@ -1051,19 +1077,36 @@ class NetworkWorldClient:
             except OSError:
                 self.udp_enabled = False
                 self.udp_status = "fallback"
-        self._send_tcp_now(message)
+        self._send_tcp_now(message, track_pending=False)
 
-    def _send_tcp_now(self, message: dict[str, Any]) -> None:
+    def _send_tcp_now(self, message: dict[str, Any], track_pending: bool = False) -> None:
         sock = self._sock
-        if sock is None or not self.connected:
-            return
-        if message.pop("_attach_asset", False):
-            digest = str(message.get("hash", ""))
-            message["asset"] = self.asset_payload(digest)
+        failed = False
         try:
+            if sock is None or not self.connected:
+                failed = True
+                return
+            if message.pop("_attach_asset", False):
+                digest = str(message.get("hash", ""))
+                message["asset"] = self.asset_payload(digest)
+                if message["asset"] is None:
+                    failed = True
+                    return
             send_socket_message(sock, message)
-        except OSError:
+        except (OSError, WorldFormatError):
             self.connected = False
+            failed = True
+        finally:
+            if track_pending:
+                self._mark_send_complete(failed=failed)
+
+    def _mark_send_complete(self, failed: bool = False) -> None:
+        with self._send_condition:
+            if self._send_pending > 0:
+                self._send_pending -= 1
+            if failed:
+                self._send_failed += 1
+            self._send_condition.notify_all()
 
     def _optional_int(self, value: object) -> int | None:
         if value is None:

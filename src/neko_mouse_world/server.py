@@ -590,7 +590,8 @@ class WorldServerState:
                 self._handle_rotate(client, message)
             elif message_type == "asset":
                 digest = str(message.get("hash", ""))
-                self._ensure_asset(digest, message.get("asset"))
+                if self._ensure_asset(digest, message.get("asset")):
+                    self._broadcast_asset_if_present(digest)
             elif message_type == "udp_probe_result":
                 self._handle_udp_probe_result(client, message)
             elif message_type == "player_state":

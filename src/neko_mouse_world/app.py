@@ -1298,6 +1298,7 @@ class NekoMouseWorldApp(ShowBase):
         z: int | float | None = None,
         digest: str | None = None,
         orientation: int | None = None,
+        include_asset: bool = True,
     ) -> bool:
         """Place or replace a world box at a grid cell.
 
@@ -1320,8 +1321,39 @@ class NekoMouseWorldApp(ShowBase):
         except (BoxFormatError, WorldFormatError) as exc:
             self._set_status(f"Cannot set box: {exc}")
             return False
-        self._set_world_box_with_orientation(cell, target_digest, target_orientation)
+        self._set_world_box_with_orientation(cell, target_digest, target_orientation, include_asset=include_asset)
         self._set_status(f"Set {cell} -> {target_digest[:12]} orientation={target_orientation}")
+        return True
+
+    def wait_for_network_sends(self, timeout: float = 5.0) -> bool:
+        """Wait until queued TCP edits have been handed to the network socket."""
+        if self.network_client is None:
+            return True
+        return self.network_client.wait_for_pending_sends(timeout)
+
+    def pending_network_sends(self) -> int:
+        """Return queued or in-flight TCP edit messages for automation diagnostics."""
+        if self.network_client is None:
+            return 0
+        return self.network_client.pending_send_count()
+
+    def failed_network_sends(self) -> int:
+        """Return TCP send failures observed by the network client."""
+        if self.network_client is None:
+            return 0
+        return self.network_client.failed_send_count()
+
+    def send_box_asset_to_server(self, digest: str) -> bool:
+        """Queue a reusable .box asset upload without changing any world cell."""
+        if self.network_client is None:
+            return True
+        digest_text = str(digest or "")
+        try:
+            self.surface_cache.get(digest_text)
+        except BoxFormatError as exc:
+            self._set_status(f"Cannot send asset: {exc}")
+            return False
+        self.network_client.send_asset(digest_text)
         return True
 
     def delete_world_box_at(
@@ -2800,14 +2832,14 @@ class NekoMouseWorldApp(ShowBase):
         existing_orientation = self.world_map.get_orientation(cell) if existing else IDENTITY_ORIENTATION
         self._set_world_box_with_orientation(cell, digest, existing_orientation)
 
-    def _set_world_box_with_orientation(self, cell: Cell, digest: str, orientation: int) -> None:
+    def _set_world_box_with_orientation(self, cell: Cell, digest: str, orientation: int, include_asset: bool = True) -> None:
         existing = cell in self.world_map.boxes
         self._apply_world_box(cell, digest, orientation)
         if self.network_client is not None:
             if existing:
-                self.network_client.send_set_box(cell, digest, orientation, include_asset=True)
+                self.network_client.send_set_box(cell, digest, orientation, include_asset=include_asset)
             else:
-                self.network_client.send_place(cell, digest, orientation, include_asset=True)
+                self.network_client.send_place(cell, digest, orientation, include_asset=include_asset)
             return
 
     def _apply_world_box(self, cell: Cell, digest: str, orientation: int, rebuild_now: bool = True) -> None:

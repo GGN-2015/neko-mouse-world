@@ -32,6 +32,12 @@ app.run()
 - `get_box_orientation_at(x, y, z)` returns the orientation `0..23`, or `None`
   if the cell is empty.
 - `get_box_at(x, y, z)` returns `(hash, orientation)`, or `None` if empty.
+- `pending_network_sends()` returns queued or in-flight TCP messages.
+- `failed_network_sends()` returns TCP send failures observed by the client.
+- `wait_for_network_sends(timeout=5)` waits for queued TCP messages to be
+  handed to the socket.
+- `send_box_asset_to_server(hash)` queues a reusable `.box` asset upload
+  without changing any world cell.
 
 ## Screenshots
 
