@@ -23,7 +23,7 @@ from .orientation import IDENTITY_ORIENTATION, rotate_normal, rotate_outer_face,
 from .world_file import Cell, box_path_for_hash
 
 
-WORLD_CHUNK_SIZE = 1
+WORLD_CHUNK_SIZE = 8
 FACE_NORMALS: tuple[FaceNormal, ...] = (
     (1, 0, 0),
     (-1, 0, 0),
@@ -220,6 +220,37 @@ def build_world_chunk_mesh(
     )
 
 
+def build_box_preview_mesh(surface: BoxSurface, orientation: int, name: str = "box-preview") -> NodePath | None:
+    opaque = _MeshBuilder(f"{name}-opaque")
+    transparent = _MeshBuilder(f"{name}-transparent")
+    for normal, vertices, color, _outer_face in surface.opaque_quads:
+        opaque.add_quad(
+            _center_vertices(_rotate_vertices(vertices, orientation)),
+            rotate_normal(normal, orientation),
+            color,
+        )
+    for normal, vertices, color, _outer_face in surface.transparent_quads:
+        transparent.add_quad(
+            _center_vertices(_rotate_vertices(vertices, orientation)),
+            rotate_normal(normal, orientation),
+            color,
+        )
+
+    opaque_node = opaque.to_node()
+    transparent_node = transparent.to_node()
+    if opaque_node is None and transparent_node is None:
+        return None
+    root = NodePath(name)
+    if opaque_node is not None:
+        opaque_node.reparentTo(root)
+    if transparent_node is not None:
+        transparent_node.setTransparency(TransparencyAttrib.MAlpha)
+        transparent_node.setBin("transparent", 0)
+        transparent_node.setDepthWrite(False)
+        transparent_node.reparentTo(root)
+    return root
+
+
 def _hidden_world_faces(
     cell: Cell,
     world_boxes: Mapping[Cell, str],
@@ -255,6 +286,10 @@ def _rotate_vertices(vertices: tuple[tuple[float, float, float], ...], orientati
     if orientation == IDENTITY_ORIENTATION:
         return vertices
     return tuple(rotate_point(vertex, orientation) for vertex in vertices)
+
+
+def _center_vertices(vertices: tuple[tuple[float, float, float], ...]) -> tuple[tuple[float, float, float], ...]:
+    return tuple((vertex[0] - 0.5, vertex[1] - 0.5, vertex[2] - 0.5) for vertex in vertices)
 
 
 def _opaque_full_boundary_faces(box_map: BoxMap) -> frozenset[FaceNormal]:

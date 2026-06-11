@@ -12,7 +12,7 @@ import tempfile
 import time
 from typing import Callable
 
-from direct.gui.DirectGui import DirectButton, DirectEntry, DirectFrame, DirectLabel, DirectScrollBar
+from direct.gui.DirectGui import DirectButton, DirectEntry, DirectFrame, DirectLabel
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
 from direct.showbase.ShowBaseGlobal import globalClock
@@ -32,6 +32,7 @@ from panda3d.core import (
     Point2,
     Point3,
     PointLight,
+    TextNode,
     TransparencyAttrib,
     Vec3,
     WindowProperties,
@@ -49,13 +50,14 @@ from .box_mesh import (
     BoxSurfaceCache,
     ChunkKey,
     WorldChunkMesh,
+    build_box_preview_mesh,
     build_world_chunk_mesh,
     chunk_key_for_cell,
     chunk_keys_for_cell_and_neighbors,
 )
-from .client_net import NetworkWorldClient, RemotePlayer
+from .client_net import DEFAULT_PERMISSIONS as CLIENT_DEFAULT_PERMISSIONS, NetworkWorldClient, RemotePlayer
 from .collision import CollisionShapeCache
-from .net_protocol import list_to_cell
+from .net_protocol import SERVER_LOG_PERMISSION_DENIED_LINE, list_to_cell
 from .orientation import IDENTITY_ORIENTATION, nearest_axis, rotate_normal, rotate_point, turn_orientation_around_axis
 from .world_file import Cell, LoadedWorld, WorldFormatError, WorldMap, save_world
 
@@ -81,11 +83,16 @@ EYE_HEIGHT = 1.70
 CAMERA_NEAR = 0.03
 CAMERA_FOV = 82.0
 POINT_LIGHT_UPDATE_INTERVAL = 0.20
+POINT_LIGHT_ACTIVE_UPDATE_INTERVAL = 0.60
 POINT_LIGHT_MAX_DISTANCE = 34.0
-POINT_LIGHT_ALWAYS_DISTANCE = 5.0
-POINT_LIGHT_VIEW_DOT_MIN = math.cos(math.radians(min(89.0, CAMERA_FOV * 0.5 + 20.0)))
-MAX_ACTIVE_POINT_LIGHTS = 24
-POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL = 0.08
+POINT_LIGHT_SPATIAL_CHUNK = 8
+POINT_LIGHT_PREFILTER_LIMIT = 64
+POINT_LIGHT_OCCLUSION_TEST_LIMIT = 24
+POINT_LIGHT_OCCLUSION_CACHE_SECONDS = 0.75
+POINT_LIGHT_OCCLUSION_CACHE_LIMIT = 512
+POINT_LIGHT_BLOCKING_FACE_CACHE_LIMIT = 8192
+MAX_ACTIVE_POINT_LIGHTS = 8
+POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL = 0.25
 MOVE_SPEED = 5.2
 FLY_VERTICAL_SPEED = 4.4
 MOUSE_SENSITIVITY = 0.055
@@ -110,8 +117,28 @@ NETWORK_APPLY_FRAME_BUDGET = 0.003
 CHUNK_REBUILD_FRAME_BUDGET = 0.006
 PLAYER_INPUT_IDLE_SYNC_DELAY = 0.25
 REMOTE_PLAYER_PREDICTION_SECONDS = 1.0
+REMOTE_HELD_TEMPLATE_CACHE_LIMIT = 96
+REMOTE_HELD_MODEL_BUILDS_PER_FRAME = 1
+STARTUP_MAXIMIZE_RETRY_SECONDS = 1.0
+STARTUP_MAXIMIZE_RETRY_INTERVAL = 0.10
+STARTUP_MAXIMIZE_TASK_NAME = "neko-mouse-world-startup-maximize"
 CONSOLE_LOG_LIMIT = 300
 CONSOLE_VISIBLE_LINES = 19
+CONSOLE_SCROLL_X = 0.99
+CONSOLE_SCROLL_TRACK_TOP = 0.50
+CONSOLE_SCROLL_TRACK_BOTTOM = -0.46
+CONSOLE_SCROLL_THUMB_MIN_HEIGHT = 0.08
+CONSOLE_COMMAND_MAX_CHARS = 4096
+CONSOLE_INPUT_WRAP_WIDTH = 48.0
+CONSOLE_INPUT_WRAP_CHARS = 78
+CONSOLE_INPUT_MIN_LINES = 1
+CONSOLE_INPUT_MAX_LINES = 3
+CONSOLE_INPUT_BASE_HEIGHT = 0.104
+CONSOLE_INPUT_LINE_STEP = 0.052
+CONSOLE_INPUT_BOTTOM = -0.700
+CONSOLE_INPUT_CENTER_Z = -0.620
+CONSOLE_INPUT_SCROLL_X = 0.55
+CONSOLE_INPUT_SCROLL_THUMB_MIN_HEIGHT = 0.026
 
 
 @dataclass
@@ -141,6 +168,10 @@ class _BoxLightCandidate:
 class _RemotePlayerRender:
     root: NodePath
     limbs: dict[str, NodePath]
+    name_label: NodePath
+    held_anchor: NodePath
+    held_model: NodePath | None
+    held_key: tuple[str, int] | None
     phase: float
     last_update: float
 
@@ -161,6 +192,7 @@ class NekoMouseWorldApp(ShowBase):
         show_connect_dialog: bool = False,
         default_connect_host: str = "127.0.0.1",
         default_connect_port: int = 5678,
+        default_user_id: str = "",
     ) -> None:
         super().__init__()
         self.disableMouse()
@@ -170,9 +202,12 @@ class NekoMouseWorldApp(ShowBase):
 
         self.paths = loaded_world.paths
         self.network_client = network_client
+        self.permissions = dict(network_client.permissions) if network_client is not None else dict(CLIENT_DEFAULT_PERMISSIONS)
+        self.display_user_id = bool(network_client.client_config.get("display_user_id", True)) if network_client is not None else True
         self.connect_required = show_connect_dialog and network_client is None
         self.default_connect_host = default_connect_host
         self.default_connect_port = default_connect_port
+        self.default_user_id = default_user_id
         self.world_map: WorldMap = loaded_world.world_map
         self.server_initial_load_progress_used = network_client is None and not show_connect_dialog
         self.default_hash = network_client.default_hash if network_client and network_client.default_hash else ensure_default_box(self.paths.boxes_dir)
@@ -180,8 +215,9 @@ class NekoMouseWorldApp(ShowBase):
         self.selected_orientation = IDENTITY_ORIENTATION
         self.saved_snapshot = "" if network_client is not None else self._current_world_snapshot()
         self.gpu_profile: GpuProfile = detect_gpu_profile(self.win.getGsg() if self.win else None)
-        self._startup_window_maximize_attempted = False
-        self._maximize_startup_window_once()
+        self._startup_window_maximize_done = True
+        self._startup_window_maximize_started = 0.0
+        self._startup_window_next_maximize_attempt = 0.0
         self.ime_disabled = disable_ime_for_window(self.win)
 
         self.world = self.render.attachNewNode("world")
@@ -198,6 +234,9 @@ class NekoMouseWorldApp(ShowBase):
         self.chunk_index: dict[ChunkKey, set[Cell]] = {}
         self.digest_index: dict[str, set[Cell]] = {}
         self.box_light_candidates: dict[Cell, tuple[_BoxLightCandidate, ...]] = {}
+        self.box_light_spatial_index: dict[tuple[int, int, int], set[tuple[Cell, int]]] = {}
+        self.box_light_occlusion_cache: dict[tuple[Cell, int], tuple[tuple[int, int, int], bool, float]] = {}
+        self.box_light_blocking_face_cache: dict[Cell, frozenset[Cell]] = {}
         self.active_box_lights: dict[tuple[Cell, int], NodePath] = {}
         self.next_point_light_update = 0.0
         self.next_point_light_prune = 0.0
@@ -211,6 +250,12 @@ class NekoMouseWorldApp(ShowBase):
         self.player_velocity = Vec3(0, 0, 0)
         self.heading = 0.0
         self.pitch = -10.0
+        self.network_spawn_pos: tuple[float, float, float] | None = None
+        self.network_client_loaded_sent = network_client is None
+        self.held_item_root: NodePath | None = None
+        self.held_item_model: NodePath | None = None
+        self.held_item_key: tuple[str, int] | None = None
+        self.held_item_visible = False
         self.view_mode = "first"
         self.move_mode = "walk"
         self.vertical_velocity = 0.0
@@ -223,11 +268,22 @@ class NekoMouseWorldApp(ShowBase):
         self.focus_pause_panel: DirectFrame | None = None
         self.disconnect_panel: DirectFrame | None = None
         self.disconnect_message: DirectLabel | None = None
+        self.kicked_panel: DirectFrame | None = None
+        self.kicked_reason = ""
+        self.connect_refused_panel: DirectFrame | None = None
+        self.version_mismatch_panel: DirectFrame | None = None
         self.console_panel: DirectFrame | None = None
-        self.console_log_label: DirectLabel | None = None
+        self.console_log_labels: list[DirectLabel] = []
         self.console_entry: DirectEntry | None = None
-        self.console_scrollbar: DirectScrollBar | None = None
-        self.console_logs: list[str] = []
+        self.console_send_button: DirectButton | None = None
+        self.console_input_scrollbar: DirectFrame | None = None
+        self.console_input_scroll_thumb: DirectFrame | None = None
+        self.console_input_scroll_buttons: list[DirectButton] = []
+        self.console_entry_event_names: list[str] = []
+        self.console_entry_wrapped_line_count = 1
+        self.console_scrollbar: DirectFrame | None = None
+        self.console_scroll_thumb: DirectFrame | None = None
+        self.console_logs: list[dict[str, str]] = []
         self.console_scroll_offset = 0
         self.loading_panel: DirectFrame | None = None
         self.loading_bar_fill: DirectFrame | None = None
@@ -258,6 +314,10 @@ class NekoMouseWorldApp(ShowBase):
         self.active_quit_choice = "cancel"
         self.removed_missing_refs = loaded_world.removed_missing_refs
         self.remote_player_nodes: dict[int, _RemotePlayerRender] = {}
+        self.remote_held_model_templates: dict[tuple[str, int], NodePath] = {}
+        self.remote_held_pending_builds: deque[tuple[str, int]] = deque()
+        self.remote_held_pending_build_set: set[tuple[str, int]] = set()
+        self.last_sent_held_item_key: tuple[str, int, bool] | None = None
         self.last_udp_player_state = 0.0
         self.last_player_input_time = 0.0
         self.next_hud_update = 0.0
@@ -275,6 +335,7 @@ class NekoMouseWorldApp(ShowBase):
 
         self._setup_lights()
         self._setup_player_model()
+        self._setup_held_item()
         self._setup_hud()
         self._setup_audio()
         self._bind_events()
@@ -293,6 +354,9 @@ class NekoMouseWorldApp(ShowBase):
             self._open_connect_dialog()
         elif self.network_client and not self.network_client.connected:
             self._show_disconnect_panel("Connecting to server...")
+        elif self.network_client is None and not self.connect_required:
+            self._refresh_held_item(force=True)
+            self._begin_startup_maximize_retry()
 
     def _setup_lights(self) -> None:
         ambient = AmbientLight("ambient")
@@ -340,6 +404,72 @@ class NekoMouseWorldApp(ShowBase):
         part.setPos(*pos)
         part.setColor(*color)
 
+    def _setup_held_item(self) -> None:
+        self.held_item_root = self.camera.attachNewNode("held-item")
+        self.held_item_root.setPos(0.76, 1.18, -0.58)
+        self.held_item_root.setHpr(-18, -10, 6)
+        self.held_item_root.setBin("fixed", 20)
+        self.held_item_root.setDepthTest(False)
+        self.held_item_root.setDepthWrite(False)
+        self.held_item_root.hide()
+        hand = make_cuboid("held-right-hand", (0.22, 0.30, 0.20))
+        hand.reparentTo(self.held_item_root)
+        hand.setPos(0.10, -0.05, -0.09)
+        hand.setHpr(-12, 18, -8)
+        hand.setColor(0.86, 0.70, 0.52, 1)
+        sleeve = make_cuboid("held-sleeve", (0.24, 0.42, 0.22))
+        sleeve.reparentTo(self.held_item_root)
+        sleeve.setPos(0.19, -0.26, -0.12)
+        sleeve.setHpr(-12, 18, -8)
+        sleeve.setColor(0.10, 0.34, 0.88, 1)
+
+    def _refresh_held_item(self, force: bool = False) -> None:
+        if self.held_item_root is None:
+            return
+        visible = bool(
+            self.permissions.get("allow_set", True)
+            and self.world_load_job is None
+            and self.modal_mode not in {"kicked", "connect_refused", "version_mismatch"}
+            and self.selected_hash
+        )
+        key = (self.selected_hash, self.selected_orientation) if visible else None
+        if not force and visible == self.held_item_visible and key == self.held_item_key:
+            return
+        self.held_item_visible = bool(visible)
+        self.held_item_key = key
+        self.last_sent_held_item_key = None
+        if self.held_item_model is not None:
+            self.held_item_model.removeNode()
+            self.held_item_model = None
+        if not visible or key is None:
+            self.held_item_root.hide()
+            return
+        try:
+            surface = self.surface_cache.get(key[0])
+            model = build_box_preview_mesh(surface, key[1], "held-box-preview")
+        except (BoxFormatError, ValueError):
+            model = None
+        if model is None:
+            self.held_item_root.hide()
+            return
+        model.reparentTo(self.held_item_root)
+        model.setPos(-0.02, 0.08, 0.12)
+        model.setScale(0.42)
+        model.setHpr(28, -24, 12)
+        model.setTwoSided(True)
+        self.held_item_model = model
+        self.held_item_root.show()
+
+    def _current_held_item_state(self) -> tuple[str, int, bool]:
+        visible = bool(
+            self.permissions.get("allow_set", True)
+            and self.world_load_job is None
+            and self.modal_mode not in {"kicked", "connect_refused", "version_mismatch"}
+            and self.selected_hash
+        )
+        digest = str(self.selected_hash or "") if visible else ""
+        return digest, int(self.selected_orientation), visible
+
     def _make_remote_player_render(self, player_id: int) -> _RemotePlayerRender:
         root = self.render.attachNewNode(f"remote-player-{player_id}")
         palette = (
@@ -373,8 +503,31 @@ class NekoMouseWorldApp(ShowBase):
             part.setPos(*part_pos)
             part.setColor(*color)
             limbs[name] = pivot
+        held_anchor = limbs["right-arm"].attachNewNode("held-item-anchor")
+        held_anchor.setPos(0.19, -0.13, -0.71)
+        held_anchor.setHpr(18, -12, -8)
+        name_node = TextNode(f"remote-player-{player_id}-user-id")
+        name_node.setText("")
+        name_node.setAlign(TextNode.ACenter)
+        name_node.setTextColor(1.0, 1.0, 1.0, 1.0)
+        name_label = root.attachNewNode(name_node)
+        name_label.setPos(0, 0, PLAYER_HEIGHT + 0.42)
+        name_label.setScale(0.22)
+        name_label.setBillboardPointEye()
+        name_label.setLightOff()
+        name_label.setDepthWrite(False)
+        name_label.setTransparency(TransparencyAttrib.MAlpha)
         root.setTransparency(TransparencyAttrib.MAlpha)
-        return _RemotePlayerRender(root=root, limbs=limbs, phase=0.0, last_update=time.monotonic())
+        return _RemotePlayerRender(
+            root=root,
+            limbs=limbs,
+            name_label=name_label,
+            held_anchor=held_anchor,
+            held_model=None,
+            held_key=None,
+            phase=0.0,
+            last_update=time.monotonic(),
+        )
 
     def _setup_hud(self) -> None:
         self.status = OnscreenText(
@@ -466,6 +619,8 @@ class NekoMouseWorldApp(ShowBase):
         self.accept("z", self._restore_last_deleted_box)
         for event_name in ("`", "~", "tilde"):
             self.accept(event_name, self._open_console)
+        self.accept("wheel_up", self._scroll_console_wheel, [-3])
+        self.accept("wheel_down", self._scroll_console_wheel, [3])
         for event_name, command in {
             "4": "left",
             "6": "right",
@@ -548,18 +703,24 @@ class NekoMouseWorldApp(ShowBase):
             self.grounded = False
 
     def _update(self, task):
+        if self.modal_mode in {"kicked", "connect_refused", "version_mismatch"}:
+            return task.cont
         dt = min(globalClock.getDt(), 0.05)
         previous_player_pos = Vec3(self.player_pos)
         self._check_foreground_pause()
         loading = self.world_load_job is not None
         focus_paused = self.modal_mode == "focus_pause"
-        if self.mouse_captured and not self.ui_open and not loading and not focus_paused:
+        controls_enabled = self._player_controls_enabled(loading)
+        self._sync_network_permissions_snapshot()
+        if self.mouse_captured and controls_enabled:
             self._update_mouse_look()
-        if not self.ui_open and not loading and not focus_paused:
-            self._update_player(dt)
+        if not loading:
+            self._update_player(dt, allow_input=controls_enabled)
         self._update_player_velocity(previous_player_pos, dt)
-        self._send_network_player_state()
         self._update_camera()
+        self._refresh_held_item()
+        self._sync_network_held_item()
+        self._send_network_player_state()
         if loading or focus_paused:
             self.hovered_cell = None
             self.hover_outline.hide()
@@ -571,6 +732,7 @@ class NekoMouseWorldApp(ShowBase):
         if not loading and self._can_run_background_world_sync():
             self._apply_pending_asset_updates()
             self._apply_pending_world_messages()
+            self._process_remote_held_model_builds()
             self._process_dirty_chunks()
         self._sync_remote_players()
         self._update_ground()
@@ -586,7 +748,8 @@ class NekoMouseWorldApp(ShowBase):
         else:
             self._show_disconnect_panel("Disconnected. Reconnecting...")
         poll_budget = NETWORK_POLL_MESSAGE_BUDGET
-        if self.world_load_job is None and self.modal_mode != "focus_pause" and not self._player_input_is_idle():
+        controls_enabled = self._player_controls_enabled(self.world_load_job is not None)
+        if controls_enabled and not self._player_input_is_idle():
             poll_budget = ACTIVE_INPUT_NETWORK_POLL_MESSAGE_BUDGET
         for message in self.network_client.poll(poll_budget):
             message_type = message.get("type")
@@ -599,6 +762,14 @@ class NekoMouseWorldApp(ShowBase):
                 self.default_hash = self.network_client.default_hash or self.default_hash
                 self.selected_hash = self.default_hash
                 self.selected_orientation = IDENTITY_ORIENTATION
+                self.network_client_loaded_sent = False
+                self.network_spawn_pos = self.network_client.spawn_pos
+                self._apply_network_spawn_pos()
+                self.permissions = dict(self.network_client.permissions)
+                if not self.permissions["allow_fly"] and self.move_mode == "fly":
+                    self._force_walk_mode("Flight disabled by server")
+                self._apply_client_config(self.network_client.client_config)
+                self._refresh_held_item(force=True)
                 self.world_map = self.network_client.world_map
                 self.saved_snapshot = ""
                 self._hide_disconnect_panel()
@@ -610,6 +781,8 @@ class NekoMouseWorldApp(ShowBase):
                 digest = str(message.get("hash", ""))
                 if self.world_load_job is None:
                     self.pending_asset_digests.add(digest)
+                    if digest == self.selected_hash:
+                        self._refresh_held_item(force=True)
                 else:
                     self.surface_cache.invalidate(digest)
                     self.collision_cache.invalidate(digest)
@@ -633,7 +806,30 @@ class NekoMouseWorldApp(ShowBase):
                     sent = message.get("sent", 0)
                     self._set_status(f"Connected; UDP probe {received}/{sent}, positions use TCP")
             elif message_type == "server_log":
-                self._append_console_log(str(message.get("line", "")))
+                self._append_console_log(message)
+            elif message_type == "kicked":
+                self._open_kicked_modal(str(message.get("reason", "")))
+                return
+            elif message_type == "connect_refused":
+                self._open_connect_refused_modal(str(message.get("reason", "")))
+                return
+            elif message_type == "version_mismatch":
+                self._open_version_mismatch_modal(
+                    str(message.get("server_version", "")),
+                    str(message.get("client_version", "")),
+                )
+                return
+            elif message_type == "teleport":
+                self._apply_teleport(message.get("pos"))
+            elif message_type == "permissions":
+                self._apply_permissions(message.get("permissions"))
+            elif message_type == "server_log_permission":
+                self._apply_server_log_permission(bool(message.get("allowed")), str(message.get("message", "")))
+            elif message_type == "client_config":
+                self._apply_client_config(message.get("client_config"))
+            elif message_type == "force_move_mode":
+                if str(message.get("move_mode", "walk")) == "walk":
+                    self._force_walk_mode("Flight disabled by server")
             elif message_type == "disconnect":
                 self._cancel_world_load()
                 self._show_disconnect_panel("Disconnected. Reconnecting...")
@@ -641,17 +837,64 @@ class NekoMouseWorldApp(ShowBase):
     def _send_network_player_state(self) -> None:
         if self.network_client is None or not self.network_client.connected:
             return
+        if self.world_load_job is not None or not self.network_client_loaded_sent:
+            return
         now = globalClock.getFrameTime()
         if now - self.last_udp_player_state < 0.05:
             return
         self.last_udp_player_state = now
+        held_hash, held_orientation, held_visible = self._current_held_item_state()
         self.network_client.send_player_state(
             (self.player_pos.x, self.player_pos.y, self.player_pos.z),
             (self.player_velocity.x, self.player_velocity.y, self.player_velocity.z),
             self.heading,
             self.pitch,
             self.move_mode,
+            held_hash,
+            held_orientation,
+            held_visible,
         )
+
+    def _sync_network_held_item(self, force: bool = False) -> None:
+        if self.network_client is None or not self.network_client.connected:
+            return
+        if self.world_load_job is not None or not self.network_client_loaded_sent:
+            return
+        digest, orientation, visible = self._current_held_item_state()
+        key = (digest, orientation, visible)
+        if not force and key == self.last_sent_held_item_key:
+            return
+        self.last_sent_held_item_key = key
+        self.network_client.send_held_item(digest, orientation, visible, include_asset=visible)
+
+    def _apply_network_spawn_pos(self) -> None:
+        if self.network_spawn_pos is None:
+            return
+        self.player_pos = Vec3(*self.network_spawn_pos)
+        self.player_velocity = Vec3(0, 0, 0)
+        self.vertical_velocity = 0.0
+        self.grounded = True
+        self._clear_movement_keys()
+        self.last_udp_player_state = 0.0
+        self._update_camera()
+
+    def _notify_network_client_loaded(self) -> None:
+        if self.network_client is None or not self.network_client.connected or self.network_client_loaded_sent:
+            return
+        held_hash, held_orientation, held_visible = self._current_held_item_state()
+        self.network_client.send_client_loaded(
+            (self.player_pos.x, self.player_pos.y, self.player_pos.z),
+            (self.player_velocity.x, self.player_velocity.y, self.player_velocity.z),
+            self.heading,
+            self.pitch,
+            self.move_mode,
+            held_hash,
+            held_orientation,
+            held_visible,
+        )
+        self.network_client_loaded_sent = True
+        self.last_sent_held_item_key = None
+        self.last_udp_player_state = 0.0
 
     def _sync_remote_players(self) -> None:
         if self.network_client is None:
@@ -659,7 +902,7 @@ class NekoMouseWorldApp(ShowBase):
         remote_players = self.network_client.remote_players_snapshot()
         for player_id in list(self.remote_player_nodes):
             if player_id not in remote_players:
-                self.remote_player_nodes.pop(player_id).root.removeNode()
+                self._remove_remote_player_render(player_id)
         for player_id, player in remote_players.items():
             render = self.remote_player_nodes.get(player_id)
             if render is None:
@@ -667,7 +910,41 @@ class NekoMouseWorldApp(ShowBase):
                 self.remote_player_nodes[player_id] = render
             render.root.setPos(*self._predicted_remote_player_pos(player))
             render.root.setH(player.heading)
+            self._update_remote_player_label(render, player)
+            self._sync_remote_player_held_item(render, player)
             self._animate_remote_player(render, player)
+
+    def _update_remote_player_label(self, render: _RemotePlayerRender, player: RemotePlayer) -> None:
+        if not self.display_user_id:
+            render.name_label.hide()
+            return
+        user_id = player.user_id.strip() or str(player.player_id)
+        label_node = render.name_label.node()
+        if isinstance(label_node, TextNode) and label_node.getText() != user_id:
+            label_node.setText(user_id)
+        render.name_label.show()
+
+    def _remove_remote_player_render(self, player_id: int) -> None:
+        render = self.remote_player_nodes.pop(player_id, None)
+        if render is None:
+            return
+        if render.held_model is not None:
+            render.held_model.removeNode()
+            render.held_model = None
+        render.root.removeNode()
+
+    def _sync_remote_player_labels(self) -> None:
+        if self.network_client is None:
+            for render in self.remote_player_nodes.values():
+                render.name_label.hide()
+            return
+        remote_players = self.network_client.remote_players_snapshot()
+        for player_id, render in self.remote_player_nodes.items():
+            player = remote_players.get(player_id)
+            if player is None:
+                render.name_label.hide()
+            else:
+                self._update_remote_player_label(render, player)
 
     def _predicted_remote_player_pos(self, player: RemotePlayer) -> tuple[float, float, float]:
         elapsed = max(0.0, min(REMOTE_PLAYER_PREDICTION_SECONDS, time.monotonic() - player.received_at))
@@ -703,6 +980,89 @@ class NekoMouseWorldApp(ShowBase):
                 limb.setP(angle)
                 limb.setR(roll if name.startswith("left") else -roll)
 
+    def _sync_remote_player_held_item(self, render: _RemotePlayerRender, player: RemotePlayer) -> None:
+        key = (player.held_hash, int(player.held_orientation)) if player.held_visible and player.held_hash else None
+        if key == render.held_key:
+            return
+        if render.held_model is not None:
+            render.held_model.removeNode()
+            render.held_model = None
+        render.held_key = key
+        if key is None:
+            render.held_anchor.hide()
+            return
+        template = self._remote_held_model_template(key)
+        if template is None:
+            render.held_anchor.hide()
+            return
+        model = template.copyTo(render.held_anchor)
+        model.setPos(0, 0, 0)
+        model.setScale(0.30)
+        model.setHpr(28, -24, 12)
+        model.setTwoSided(True)
+        model.show()
+        render.held_model = model
+        render.held_anchor.show()
+
+    def _remote_held_model_template(self, key: tuple[str, int]) -> NodePath | None:
+        template = self.remote_held_model_templates.get(key)
+        if template is not None:
+            return template
+        digest, orientation = key
+        try:
+            asset_ready = self.network_client is None or self.network_client.asset_path(digest).is_file()
+        except WorldFormatError:
+            asset_ready = False
+        if not asset_ready:
+            self.pending_asset_digests.add(digest)
+            if self.network_client is not None:
+                self.network_client.ensure_runtime_asset(digest)
+            return None
+        if key not in self.remote_held_pending_build_set:
+            self.remote_held_pending_build_set.add(key)
+            self.remote_held_pending_builds.append(key)
+        return None
+
+    def _process_remote_held_model_builds(self) -> None:
+        if not self.remote_held_pending_builds:
+            return
+        deadline = time.perf_counter() + NETWORK_APPLY_FRAME_BUDGET
+        built = 0
+        while self.remote_held_pending_builds:
+            key = self.remote_held_pending_builds.popleft()
+            self.remote_held_pending_build_set.discard(key)
+            if key in self.remote_held_model_templates:
+                continue
+            digest, orientation = key
+            try:
+                surface = self.surface_cache.get(digest)
+                template = build_box_preview_mesh(surface, orientation, f"remote-held-{digest[:12]}-{orientation}")
+            except (BoxFormatError, ValueError):
+                template = None
+            if template is not None:
+                template.detachNode()
+                template.hide()
+                self.remote_held_model_templates[key] = template
+                self._trim_remote_held_model_templates()
+                built += 1
+            for render in self.remote_player_nodes.values():
+                if render.held_key == key and render.held_model is None:
+                    render.held_key = None
+            if built >= REMOTE_HELD_MODEL_BUILDS_PER_FRAME or time.perf_counter() >= deadline:
+                break
+
+    def _trim_remote_held_model_templates(self) -> None:
+        while len(self.remote_held_model_templates) > REMOTE_HELD_TEMPLATE_CACHE_LIMIT:
+            key, template = next(iter(self.remote_held_model_templates.items()))
+            self.remote_held_model_templates.pop(key, None)
+            template.removeNode()
+            for render in self.remote_player_nodes.values():
+                if render.held_key == key:
+                    if render.held_model is not None:
+                        render.held_model.removeNode()
+                        render.held_model = None
+                    render.held_key = None
+
     def _update_player_velocity(self, previous_pos: Vec3, dt: float) -> None:
         if dt <= 1e-6:
             self.player_velocity = Vec3(0, 0, 0)
@@ -710,11 +1070,38 @@ class NekoMouseWorldApp(ShowBase):
         delta = self.player_pos - previous_pos
         self.player_velocity = delta / dt
 
-    def _maximize_startup_window_once(self) -> None:
-        if self._startup_window_maximize_attempted:
-            return
-        self._startup_window_maximize_attempted = True
-        maximize_window(self.win)
+    def _startup_maximize_window_task(self, task):
+        if self._startup_window_maximize_done:
+            return task.done
+        now = time.monotonic()
+        if now - self._startup_window_maximize_started > STARTUP_MAXIMIZE_RETRY_SECONDS:
+            self._startup_window_maximize_done = True
+            return task.done
+        if now < self._startup_window_next_maximize_attempt:
+            return task.cont
+        self._startup_window_next_maximize_attempt = now + STARTUP_MAXIMIZE_RETRY_INTERVAL
+        if self.win is None or self.win.getXSize() <= 1 or self.win.getYSize() <= 1:
+            return task.cont
+        try:
+            self._request_startup_window_maximize()
+        except Exception:
+            return task.cont
+        return task.cont
+
+    def _begin_startup_maximize_retry(self) -> None:
+        self.taskMgr.remove(STARTUP_MAXIMIZE_TASK_NAME)
+        self._startup_window_maximize_done = False
+        self._startup_window_maximize_started = time.monotonic()
+        self._startup_window_next_maximize_attempt = 0.0
+        self.taskMgr.add(self._startup_maximize_window_task, STARTUP_MAXIMIZE_TASK_NAME)
+
+    def _request_startup_window_maximize(self) -> bool:
+        if sys.platform == "win32":
+            hwnd = _panda_window_hwnd(self.win)
+            if hwnd is None:
+                return False
+            return _maximize_windows_hwnd(hwnd)
+        return maximize_window(self.win)
 
     def _update_mouse_look(self) -> None:
         if not self.win or not hasattr(self.win, "getPointer"):
@@ -734,11 +1121,36 @@ class NekoMouseWorldApp(ShowBase):
         self.last_player_input_time = globalClock.getFrameTime()
 
     def _can_run_background_world_sync(self) -> bool:
-        if self.modal_mode == "focus_pause":
+        if not self._player_controls_enabled(self.world_load_job is not None):
             return True
         if self.network_client is None:
             return True
         return self._player_input_is_idle()
+
+    def _player_controls_enabled(self, loading: bool | None = None) -> bool:
+        if loading is None:
+            loading = self.world_load_job is not None
+        return not loading and not self.ui_open and self.modal_mode is None
+
+    def _sync_network_permissions_snapshot(self) -> None:
+        if self.network_client is None:
+            return
+        permissions = dict(self.network_client.permissions)
+        if permissions != self.permissions:
+            self._apply_permissions(permissions)
+        self._apply_client_config(self.network_client.client_config, show_status=False)
+
+    def _apply_client_config(self, value: object, show_status: bool = True) -> None:
+        previous = self.display_user_id
+        display_user_id = True
+        if isinstance(value, dict) and "display_user_id" in value:
+            display_user_id = bool(value["display_user_id"])
+        self.display_user_id = display_user_id
+        if previous != display_user_id:
+            self._sync_remote_player_labels()
+            if show_status:
+                state = "shown" if display_user_id else "hidden"
+                self._set_status(f"User ID labels {state}")
 
     def _player_input_is_idle(self) -> bool:
         if any(self.key_state.values()):
@@ -747,28 +1159,28 @@ class NekoMouseWorldApp(ShowBase):
             return False
         return globalClock.getFrameTime() - self.last_player_input_time >= PLAYER_INPUT_IDLE_SYNC_DELAY
 
-    def _update_player(self, dt: float) -> None:
+    def _update_player(self, dt: float, allow_input: bool = True) -> None:
         heading_rad = math.radians(self.heading)
         forward = Vec3(-math.sin(heading_rad), math.cos(heading_rad), 0)
         right = Vec3(math.cos(heading_rad), math.sin(heading_rad), 0)
         desired = Vec3(0, 0, 0)
 
-        if self.key_state["forward"]:
+        if allow_input and self.key_state["forward"]:
             desired += forward
-        if self.key_state["back"]:
+        if allow_input and self.key_state["back"]:
             desired -= forward
-        if self.key_state["right"]:
+        if allow_input and self.key_state["right"]:
             desired += right
-        if self.key_state["left"]:
+        if allow_input and self.key_state["left"]:
             desired -= right
         if desired.lengthSquared() > 0:
             desired.normalize()
             desired *= MOVE_SPEED * dt
 
         if self.move_mode == "fly":
-            if self.key_state["up"]:
+            if allow_input and self.key_state["up"]:
                 desired.z += FLY_VERTICAL_SPEED * dt
-            if self.key_state["down"]:
+            if allow_input and self.key_state["down"]:
                 desired.z -= FLY_VERTICAL_SPEED * dt
             self.vertical_velocity = 0.0
             self.grounded = False
@@ -1034,11 +1446,19 @@ class NekoMouseWorldApp(ShowBase):
         quad_count = self.total_chunk_quads
         net_mode = ""
         if self.network_client is not None:
-            net_mode = f"  net={self.network_client.udp_status}"
+            user_text = self.network_client.user_id or "pending"
+            net_mode = f"  user={user_text}  net={self.network_client.udp_status}"
+        restricted_items = [
+            label
+            for label, key in (("set", "allow_set"), ("fly", "allow_fly"), ("break", "allow_break"), ("cmd", "allow_cmd"))
+            if not self.permissions.get(key, True)
+        ]
+        restricted = ",".join(restricted_items)
+        permission_text = f"  restricted={restricted}" if restricted else ""
         text = (
             f"{self.paths.root.name}  boxes={len(self.world_map.boxes)}  "
             f"chunks={chunk_count}  quads={quad_count}  target={target}  selected={selected}  "
-            f"move={self.move_mode}  view={self.view_mode}  {gpu_mode}{net_mode}"
+            f"move={self.move_mode}  view={self.view_mode}  {gpu_mode}{net_mode}{permission_text}"
         )
         if text != self.last_detail_text:
             self.detail.setText(text)
@@ -1083,6 +1503,8 @@ class NekoMouseWorldApp(ShowBase):
         hit_type, cell, normal, point = hit
         if self.move_mode == "fly" and self.key_state["down"]:
             return
+        if not self._permission_allowed("allow_set", "place boxes"):
+            return
 
         target = self._placement_cell(hit_type, cell, normal, point)
         if target is None or target in self.world_map.boxes:
@@ -1115,6 +1537,8 @@ class NekoMouseWorldApp(ShowBase):
             return
         hit_type, cell, _normal, _point = hit
         if hit_type == "block" and cell is not None:
+            if not self._permission_allowed("allow_break", "break boxes"):
+                return
             if not self._can_edit_world():
                 return
             digest = self.world_map.get_box(cell)
@@ -1149,6 +1573,7 @@ class NekoMouseWorldApp(ShowBase):
             return
         self.selected_hash = digest
         self.selected_orientation = self.world_map.get_orientation(cell)
+        self._refresh_held_item(force=True)
         self._set_status(f"Selected {digest[:12]} orientation={self.selected_orientation}")
 
     def _rotate_target_box(self, command: str) -> None:
@@ -1168,6 +1593,8 @@ class NekoMouseWorldApp(ShowBase):
             return
         hit_type, cell, _normal, _point = hit
         if hit_type != "block" or cell is None or cell not in self.world_map.boxes:
+            return
+        if not self._permission_allowed("allow_set", "rotate boxes"):
             return
         if not self._can_edit_world():
             return
@@ -1228,6 +1655,8 @@ class NekoMouseWorldApp(ShowBase):
             return
         hit_type, cell, _normal, _point = hit
         if hit_type != "block" or cell is None:
+            return
+        if not self._permission_allowed("allow_set", "edit boxes"):
             return
         if not self._can_edit_world():
             return
@@ -1327,6 +1756,7 @@ class NekoMouseWorldApp(ShowBase):
             self.collision_cache.invalidate(new_digest)
             self.selected_hash = new_digest
             self.selected_orientation = self.world_map.get_orientation(cell)
+            self._refresh_held_item(force=True)
             if new_digest != digest:
                 self._set_world_box_with_orientation(cell, new_digest, self.selected_orientation)
                 self._set_status(f"Updated {cell} -> {new_digest[:12]} orientation={self.selected_orientation}")
@@ -1377,6 +1807,8 @@ class NekoMouseWorldApp(ShowBase):
         if self.world_load_job is not None:
             return
         if self.ui_open:
+            return
+        if self.move_mode == "walk" and not self._permission_allowed("allow_fly", "fly"):
             return
         self.move_mode = "fly" if self.move_mode == "walk" else "walk"
         self.vertical_velocity = 0.0
@@ -1686,6 +2118,7 @@ class NekoMouseWorldApp(ShowBase):
         if job is None:
             return
         self.world_load_job = None
+        trigger_startup_maximize = job.show_progress and not self.server_initial_load_progress_used
         if job.show_progress:
             self.server_initial_load_progress_used = True
             self._set_loading_progress("Ready", 1.0)
@@ -1695,6 +2128,10 @@ class NekoMouseWorldApp(ShowBase):
         if job.show_progress:
             self._close_loading_panel()
             self.set_mouse_capture(True)
+        self._refresh_held_item(force=True)
+        self._notify_network_client_loaded()
+        if trigger_startup_maximize:
+            self._begin_startup_maximize_retry()
         self._set_status(job.complete_status)
 
     def _cancel_world_load(self) -> None:
@@ -1743,9 +2180,23 @@ class NekoMouseWorldApp(ShowBase):
         self.chunk_meshes.clear()
         self.total_chunk_quads = 0
         self._clear_box_lights()
+        self._clear_remote_held_model_templates()
         self.waiting_asset_world_messages.clear()
         self.dirty_chunk_keys.clear()
         self.dirty_chunk_queue.clear()
+
+    def _clear_remote_held_model_templates(self) -> None:
+        for template in self.remote_held_model_templates.values():
+            template.removeNode()
+        self.remote_held_model_templates.clear()
+        self.remote_held_pending_builds.clear()
+        self.remote_held_pending_build_set.clear()
+        for render in self.remote_player_nodes.values():
+            if render.held_model is not None:
+                render.held_model.removeNode()
+                render.held_model = None
+            render.held_key = None
+            render.held_anchor.hide()
 
     def _apply_deferred_world_messages(self) -> None:
         self.pending_world_messages.extend(self.deferred_world_messages)
@@ -1770,12 +2221,26 @@ class NekoMouseWorldApp(ShowBase):
             self.pending_asset_digests.discard(digest)
             self.surface_cache.invalidate(digest)
             self.collision_cache.invalidate(digest)
+            self._invalidate_remote_held_model_templates(digest)
             self._mark_chunks_dirty_for_digest(digest)
             waiting = self.waiting_asset_world_messages.pop(digest, [])
             if waiting:
                 self.pending_world_messages.extend(waiting)
             if time.perf_counter() >= deadline:
                 break
+
+    def _invalidate_remote_held_model_templates(self, digest: str) -> None:
+        stale_keys = [key for key in self.remote_held_model_templates if key[0] == digest]
+        for key in stale_keys:
+            self.remote_held_model_templates.pop(key).removeNode()
+        self.remote_held_pending_builds = deque(key for key in self.remote_held_pending_builds if key[0] != digest)
+        self.remote_held_pending_build_set = {key for key in self.remote_held_pending_build_set if key[0] != digest}
+        for render in self.remote_player_nodes.values():
+            if render.held_key is not None and render.held_key[0] == digest:
+                if render.held_model is not None:
+                    render.held_model.removeNode()
+                    render.held_model = None
+                render.held_key = None
 
     def _apply_pending_world_messages(self) -> None:
         deadline = time.perf_counter() + NETWORK_APPLY_FRAME_BUDGET
@@ -1855,6 +2320,7 @@ class NekoMouseWorldApp(ShowBase):
         old_digest = self.world_map.get_box(cell)
         old_key = chunk_key_for_cell(cell) if cell in self.world_map.boxes else None
         self.world_map.set_box(cell, digest, orientation)
+        self.box_light_blocking_face_cache.pop(cell, None)
         key = chunk_key_for_cell(cell)
         self.chunk_index.setdefault(key, set()).add(cell)
         if old_digest is not None and old_digest != digest:
@@ -1885,6 +2351,7 @@ class NekoMouseWorldApp(ShowBase):
         old_digest = self.world_map.get_box(cell)
         if not self.world_map.remove_box(cell):
             return
+        self.box_light_blocking_face_cache.pop(cell, None)
         key = chunk_key_for_cell(cell)
         cells = self.chunk_index.get(key)
         if cells is not None:
@@ -1910,6 +2377,8 @@ class NekoMouseWorldApp(ShowBase):
             self._focus_editor_if_waiting()
             return
         if self.ui_open:
+            return
+        if not self._permission_allowed("allow_set", "restore boxes"):
             return
         if not self._can_edit_world():
             return
@@ -1943,6 +2412,7 @@ class NekoMouseWorldApp(ShowBase):
             self._rebuild_chunk(key)
 
     def _mark_chunks_dirty_for_cell(self, cell: Cell, rebuild_now: bool = False) -> None:
+        self.box_light_occlusion_cache.clear()
         keys = chunk_keys_for_cell_and_neighbors(cell)
         if rebuild_now:
             for key in keys:
@@ -2014,6 +2484,8 @@ class NekoMouseWorldApp(ShowBase):
                 )
             )
         self.box_light_candidates[cell] = tuple(candidates)
+        for index, _candidate in enumerate(candidates):
+            self._add_box_light_to_spatial_index(cell, index)
         self.next_point_light_update = 0.0
 
     def _clear_box_lights(self) -> None:
@@ -2021,6 +2493,9 @@ class NekoMouseWorldApp(ShowBase):
             self._remove_box_light(light)
         self.active_box_lights.clear()
         self.box_light_candidates.clear()
+        self.box_light_spatial_index.clear()
+        self.box_light_occlusion_cache.clear()
+        self.box_light_blocking_face_cache.clear()
         self.next_point_light_update = 0.0
         self.next_point_light_prune = 0.0
 
@@ -2029,14 +2504,51 @@ class NekoMouseWorldApp(ShowBase):
             self._clear_box_lights_for_cell(cell)
 
     def _clear_box_lights_for_cell(self, cell: Cell) -> None:
-        self.box_light_candidates.pop(cell, None)
+        candidates = self.box_light_candidates.pop(cell, None)
+        if candidates is not None:
+            for index, candidate in enumerate(candidates):
+                self._remove_box_light_from_spatial_index(cell, index, candidate.position)
+                self.box_light_occlusion_cache.pop((cell, index), None)
         for key in [key for key in self.active_box_lights if key[0] == cell]:
             self._remove_box_light(self.active_box_lights.pop(key))
         self.next_point_light_update = 0.0
 
+    def _box_light_spatial_key_for_position(self, position: tuple[float, float, float]) -> tuple[int, int, int]:
+        return (
+            math.floor(position[0] / POINT_LIGHT_SPATIAL_CHUNK),
+            math.floor(position[1] / POINT_LIGHT_SPATIAL_CHUNK),
+            math.floor(position[2] / POINT_LIGHT_SPATIAL_CHUNK),
+        )
+
+    def _add_box_light_to_spatial_index(self, cell: Cell, index: int) -> None:
+        candidates = self.box_light_candidates.get(cell, ())
+        if index >= len(candidates):
+            return
+        key = self._box_light_spatial_key_for_position(candidates[index].position)
+        self.box_light_spatial_index.setdefault(key, set()).add((cell, index))
+
+    def _remove_box_light_from_spatial_index(
+        self,
+        cell: Cell,
+        index: int,
+        position: tuple[float, float, float],
+    ) -> None:
+        key = self._box_light_spatial_key_for_position(position)
+        bucket = self.box_light_spatial_index.get(key)
+        if bucket is None:
+            return
+        bucket.discard((cell, index))
+        if not bucket:
+            self.box_light_spatial_index.pop(key, None)
+
     def _update_visible_box_lights(self, force: bool = False) -> None:
+        if self.world_load_job is not None:
+            return
         now = globalClock.getFrameTime()
         if not force and not self._player_input_is_idle():
+            if now >= self.next_point_light_update:
+                self.next_point_light_update = now + POINT_LIGHT_ACTIVE_UPDATE_INTERVAL
+                self._sync_desired_box_lights()
             self._prune_occluded_active_box_lights(now)
             return
         if not force and now < self.next_point_light_update:
@@ -2044,6 +2556,9 @@ class NekoMouseWorldApp(ShowBase):
             return
         self.next_point_light_update = now + POINT_LIGHT_UPDATE_INTERVAL
         self.next_point_light_prune = now + POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL
+        self._sync_desired_box_lights()
+
+    def _sync_desired_box_lights(self) -> None:
         desired = self._desired_box_light_keys()
         for key in [key for key in self.active_box_lights if key not in desired]:
             self._remove_box_light(self.active_box_lights.pop(key))
@@ -2058,39 +2573,104 @@ class NekoMouseWorldApp(ShowBase):
             return
         self.next_point_light_prune = now + POINT_LIGHT_OCCLUSION_PRUNE_INTERVAL
         camera_pos = self.camera.getPos(self.render)
+        max_distance_sq = POINT_LIGHT_MAX_DISTANCE * POINT_LIGHT_MAX_DISTANCE
         for key in list(self.active_box_lights):
             candidate = self.box_light_candidates.get(key[0], ())
             if key[1] >= len(candidate):
                 self._remove_box_light(self.active_box_lights.pop(key))
                 continue
-            if self._is_box_light_occluded(camera_pos, candidate[key[1]].position, key[0]):
+            light = candidate[key[1]]
+            dx = light.position[0] - camera_pos.x
+            dy = light.position[1] - camera_pos.y
+            dz = light.position[2] - camera_pos.z
+            if dx * dx + dy * dy + dz * dz > max_distance_sq:
+                self._remove_box_light(self.active_box_lights.pop(key))
+                continue
+            if self._is_box_light_occluded_cached(camera_pos, light.position, key[0], key):
                 self._remove_box_light(self.active_box_lights.pop(key))
 
     def _desired_box_light_keys(self) -> set[tuple[Cell, int]]:
         scored: list[tuple[float, Cell, int]] = []
         camera_pos = self.camera.getPos(self.render)
-        camera_forward = self.camera.getQuat(self.render).getForward()
         max_distance_sq = POINT_LIGHT_MAX_DISTANCE * POINT_LIGHT_MAX_DISTANCE
-        always_distance_sq = POINT_LIGHT_ALWAYS_DISTANCE * POINT_LIGHT_ALWAYS_DISTANCE
-        for cell, candidates in self.box_light_candidates.items():
-            for index, candidate in enumerate(candidates):
-                dx = candidate.position[0] - camera_pos.x
-                dy = candidate.position[1] - camera_pos.y
-                dz = candidate.position[2] - camera_pos.z
-                distance_sq = dx * dx + dy * dy + dz * dz
-                if distance_sq > max_distance_sq:
-                    continue
-                distance = math.sqrt(max(distance_sq, 1e-6))
-                view_dot = (dx * camera_forward.x + dy * camera_forward.y + dz * camera_forward.z) / distance
-                if distance_sq > always_distance_sq and view_dot < POINT_LIGHT_VIEW_DOT_MIN:
-                    continue
-                if self._is_box_light_occluded(camera_pos, candidate.position, cell):
-                    continue
-                brightness = max(candidate.color[0], candidate.color[1], candidate.color[2])
-                score = brightness * 100.0 + view_dot * 8.0 - distance
-                scored.append((score, cell, index))
+        for cell, index in self._nearby_box_light_keys(camera_pos):
+            candidates = self.box_light_candidates.get(cell, ())
+            if index >= len(candidates):
+                continue
+            candidate = candidates[index]
+            dx = candidate.position[0] - camera_pos.x
+            dy = candidate.position[1] - camera_pos.y
+            dz = candidate.position[2] - camera_pos.z
+            distance_sq = dx * dx + dy * dy + dz * dz
+            if distance_sq > max_distance_sq:
+                continue
+            distance = math.sqrt(max(distance_sq, 1e-6))
+            brightness = max(candidate.color[0], candidate.color[1], candidate.color[2])
+            score = brightness * 100.0 - distance
+            scored.append((score, cell, index))
         scored.sort(reverse=True)
-        return {(cell, index) for _score, cell, index in scored[:MAX_ACTIVE_POINT_LIGHTS]}
+        desired: set[tuple[Cell, int]] = set()
+        tests = 0
+        for _score, cell, index in scored[:POINT_LIGHT_PREFILTER_LIMIT]:
+            candidates = self.box_light_candidates.get(cell, ())
+            if index >= len(candidates):
+                continue
+            candidate = candidates[index]
+            if tests >= POINT_LIGHT_OCCLUSION_TEST_LIMIT:
+                break
+            tests += 1
+            if self._is_box_light_occluded_cached(camera_pos, candidate.position, cell, (cell, index)):
+                continue
+            desired.add((cell, index))
+            if len(desired) >= MAX_ACTIVE_POINT_LIGHTS:
+                break
+        return desired
+
+    def _nearby_box_light_keys(self, camera_pos: Point3 | Vec3) -> list[tuple[Cell, int]]:
+        if not self.box_light_spatial_index:
+            return []
+        radius = math.ceil(POINT_LIGHT_MAX_DISTANCE / POINT_LIGHT_SPATIAL_CHUNK)
+        center = (
+            math.floor(camera_pos.x / POINT_LIGHT_SPATIAL_CHUNK),
+            math.floor(camera_pos.y / POINT_LIGHT_SPATIAL_CHUNK),
+            math.floor(camera_pos.z / POINT_LIGHT_SPATIAL_CHUNK),
+        )
+        keys: list[tuple[Cell, int]] = []
+        for sx in range(center[0] - radius, center[0] + radius + 1):
+            for sy in range(center[1] - radius, center[1] + radius + 1):
+                for sz in range(center[2] - radius, center[2] + radius + 1):
+                    bucket = self.box_light_spatial_index.get((sx, sy, sz))
+                    if bucket:
+                        keys.extend(bucket)
+        return keys
+
+    def _is_box_light_occluded_cached(
+        self,
+        camera_pos: Point3 | Vec3,
+        light_pos: tuple[float, float, float],
+        light_cell: Cell,
+        key: tuple[Cell, int],
+    ) -> bool:
+        camera_bucket = (
+            math.floor(camera_pos.x / 2.0),
+            math.floor(camera_pos.y / 2.0),
+            math.floor(camera_pos.z / 2.0),
+        )
+        now = globalClock.getFrameTime()
+        cached = self.box_light_occlusion_cache.get(key)
+        if cached is not None:
+            cached_bucket, occluded, expires_at = cached
+            if cached_bucket == camera_bucket and now < expires_at:
+                return occluded
+        occluded = self._is_box_light_occluded(camera_pos, light_pos, light_cell)
+        if len(self.box_light_occlusion_cache) > POINT_LIGHT_OCCLUSION_CACHE_LIMIT:
+            self.box_light_occlusion_cache.clear()
+        self.box_light_occlusion_cache[key] = (
+            camera_bucket,
+            occluded,
+            now + POINT_LIGHT_OCCLUSION_CACHE_SECONDS,
+        )
+        return occluded
 
     def _is_box_light_occluded(self, camera_pos: Point3 | Vec3, light_pos: tuple[float, float, float], light_cell: Cell) -> bool:
         origin = Point3(camera_pos)
@@ -2149,20 +2729,32 @@ class NekoMouseWorldApp(ShowBase):
         return False
 
     def _cell_blocks_box_light(self, cell: Cell, entry_normal: Cell) -> bool:
-        digest = self.world_map.get_box(cell)
-        if digest is None:
-            return False
-        try:
-            surface = self.surface_cache.get(digest)
-        except BoxFormatError:
-            return False
-        orientation = self.world_map.get_orientation(cell)
-        blocking_faces = {rotate_normal(face, orientation) for face in surface.opaque_boundary_faces}
+        blocking_faces = self._box_light_blocking_faces(cell)
         if not blocking_faces:
             return False
         if entry_normal == (0, 0, 0):
             return True
         return entry_normal in blocking_faces
+
+    def _box_light_blocking_faces(self, cell: Cell) -> frozenset[Cell]:
+        cached = self.box_light_blocking_face_cache.get(cell)
+        if cached is not None:
+            return cached
+        digest = self.world_map.get_box(cell)
+        if digest is None:
+            blocking_faces: frozenset[Cell] = frozenset()
+        else:
+            try:
+                surface = self.surface_cache.get(digest)
+            except BoxFormatError:
+                blocking_faces = frozenset()
+            else:
+                orientation = self.world_map.get_orientation(cell)
+                blocking_faces = frozenset(rotate_normal(face, orientation) for face in surface.opaque_boundary_faces)
+        if len(self.box_light_blocking_face_cache) > POINT_LIGHT_BLOCKING_FACE_CACHE_LIMIT:
+            self.box_light_blocking_face_cache.clear()
+        self.box_light_blocking_face_cache[cell] = blocking_faces
+        return blocking_faces
 
     def _create_box_light(self, key: tuple[Cell, int], candidate: _BoxLightCandidate) -> NodePath:
         cell, index = key
@@ -2255,6 +2847,8 @@ class NekoMouseWorldApp(ShowBase):
                     "Walk Space: jump 1.1 units",
                     "Fly Space / Shift: move up / down",
                     "Right click: place selected box",
+                    "Right hand shows selected box when set is allowed",
+                    "Other players can see your held selected box",
                     "Left click: delete target box",
                     "Z: restore the last box you deleted",
                     "Middle click: select target box and orientation",
@@ -2263,7 +2857,13 @@ class NekoMouseWorldApp(ShowBase):
                     "F2 or Ctrl+S: show save status",
                     "F5: switch first / third person",
                     "C: look at box centroid / origin if empty",
-                    "~: open server command console",
+                    "~: server console; Enter/Send sends command",
+                    "Console input wraps up to 4096 chars",
+                    "Console: help() lists server commands",
+                    "Set permission controls place/edit/rotate/restore",
+                    "Server permissions can restrict set/fly/break/cmd",
+                    "Remote user IDs obey server DISPLAY_USER_ID",
+                    "Scroll console logs; X or Esc closes it",
                     "Esc: release mouse and show exit choices",
                 ]
             ),
@@ -2320,14 +2920,240 @@ class NekoMouseWorldApp(ShowBase):
         if self.disconnect_panel is not None:
             self.disconnect_panel.hide()
 
+    def _apply_permissions(self, value: object) -> None:
+        previous_allow_cmd = self.permissions.get("allow_cmd", True)
+        permissions = dict(CLIENT_DEFAULT_PERMISSIONS)
+        if isinstance(value, dict):
+            for key in permissions:
+                if key in value:
+                    permissions[key] = bool(value[key])
+        self.permissions = permissions
+        if not self.permissions["allow_fly"] and self.move_mode == "fly":
+            self._force_walk_mode("Flight disabled by server")
+        if previous_allow_cmd and not self.permissions.get("allow_cmd", True):
+            if self.network_client is not None:
+                self.network_client.server_logs = []
+            self._set_console_permission_denied()
+        self._refresh_held_item(force=True)
+        self._set_status("Permissions updated")
+
+    def _permission_allowed(self, permission_name: str, action: str) -> bool:
+        if self.permissions.get(permission_name, True):
+            return True
+        self._set_status(f"Not allowed to {action}")
+        return False
+
+    def _force_walk_mode(self, status: str | None = None) -> None:
+        if self.move_mode != "walk":
+            self.move_mode = "walk"
+            self.vertical_velocity = 0.0
+            self.grounded = self._support_height_below(self.player_pos, STANDING_TOLERANCE) is not None
+        self.key_state["up"] = False
+        self.key_state["down"] = False
+        if status:
+            self._set_status(status)
+
+    def _apply_teleport(self, pos: object) -> None:
+        if not isinstance(pos, list) or len(pos) != 3:
+            return
+        try:
+            target = Vec3(float(pos[0]), float(pos[1]), float(pos[2]))
+        except (TypeError, ValueError):
+            return
+        self.player_pos = target
+        self.player_velocity = Vec3(0, 0, 0)
+        self.vertical_velocity = 0.0
+        self.grounded = True
+        self._clear_movement_keys()
+        self.last_udp_player_state = 0.0
+        self._send_network_player_state()
+        self._update_camera()
+        self._set_status("Teleported by server")
+
+    def _open_kicked_modal(self, reason: str) -> None:
+        self.kicked_reason = reason
+        self._cancel_world_load()
+        self._clear_all_modal_panels()
+        self._clear_movement_keys()
+        self.set_mouse_capture(False)
+        self.crosshair.hide()
+        if self.network_client is not None:
+            self.network_client.close_after_kick()
+        self.ui_open = True
+        self.modal_mode = "kicked"
+        reason_text = reason if reason else "No reason was provided."
+        self.kicked_panel = DirectFrame(
+            frameColor=(0.05, 0.055, 0.064, 0.98),
+            frameSize=(-0.86, 0.86, -0.34, 0.34),
+            pos=(0, 0, 0),
+        )
+        DirectLabel(
+            parent=self.kicked_panel,
+            text="Removed From Server",
+            text_fg=(1, 1, 1, 1),
+            text_scale=0.056,
+            frameColor=(0, 0, 0, 0),
+            pos=(0, 0, 0.19),
+        )
+        DirectLabel(
+            parent=self.kicked_panel,
+            text=f"You have been kicked from the server.\nReason: {reason_text}",
+            text_fg=(0.94, 0.96, 0.98, 1),
+            text_scale=0.034,
+            frameColor=(0, 0, 0, 0),
+            pos=(0, 0, 0.03),
+        )
+        DirectButton(
+            parent=self.kicked_panel,
+            text="OK",
+            text_scale=0.036,
+            frameSize=(-0.16, 0.16, -0.055, 0.055),
+            frameColor=(0.24, 0.29, 0.34, 1),
+            text_fg=(1, 1, 1, 1),
+            pos=(0, 0, -0.20),
+            command=self._quit_after_kick,
+        )
+        self._set_status("Kicked from server")
+
+    def _open_connect_refused_modal(self, reason: str) -> None:
+        reason_text = reason if reason else "Server do not allow connect. (ALLOW_CONNECT = False)"
+        self._cancel_world_load()
+        self._clear_all_modal_panels()
+        self._clear_movement_keys()
+        self.set_mouse_capture(False)
+        self.crosshair.hide()
+        if self.network_client is not None:
+            self.network_client.close_after_connect_refused()
+        self.ui_open = True
+        self.modal_mode = "connect_refused"
+        self.connect_refused_panel = DirectFrame(
+            frameColor=(0.05, 0.055, 0.064, 0.98),
+            frameSize=(-0.86, 0.86, -0.34, 0.34),
+            pos=(0, 0, 0),
+        )
+        DirectLabel(
+            parent=self.connect_refused_panel,
+            text="Connection Refused",
+            text_fg=(1, 1, 1, 1),
+            text_scale=0.056,
+            frameColor=(0, 0, 0, 0),
+            pos=(0, 0, 0.19),
+        )
+        DirectLabel(
+            parent=self.connect_refused_panel,
+            text=reason_text,
+            text_fg=(0.94, 0.96, 0.98, 1),
+            text_scale=0.034,
+            frameColor=(0, 0, 0, 0),
+            pos=(0, 0, 0.03),
+        )
+        DirectButton(
+            parent=self.connect_refused_panel,
+            text="OK",
+            text_scale=0.036,
+            frameSize=(-0.16, 0.16, -0.055, 0.055),
+            frameColor=(0.24, 0.29, 0.34, 1),
+            text_fg=(1, 1, 1, 1),
+            pos=(0, 0, -0.20),
+            command=self._quit_after_kick,
+        )
+        self._set_status("Connection refused")
+
+    def _open_version_mismatch_modal(self, server_version: str, client_version: str) -> None:
+        server_text = server_version.strip() or "unknown"
+        client_text = client_version.strip() or "unknown"
+        self._cancel_world_load()
+        self._clear_all_modal_panels()
+        self._clear_movement_keys()
+        self.set_mouse_capture(False)
+        self.crosshair.hide()
+        if self.network_client is not None:
+            self.network_client.close_after_version_mismatch()
+        self.ui_open = True
+        self.modal_mode = "version_mismatch"
+        self.version_mismatch_panel = DirectFrame(
+            frameColor=(0.05, 0.055, 0.064, 0.98),
+            frameSize=(-0.86, 0.86, -0.36, 0.36),
+            pos=(0, 0, 0),
+        )
+        DirectLabel(
+            parent=self.version_mismatch_panel,
+            text="Version Mismatch",
+            text_fg=(1, 1, 1, 1),
+            text_scale=0.056,
+            frameColor=(0, 0, 0, 0),
+            pos=(0, 0, 0.20),
+        )
+        DirectLabel(
+            parent=self.version_mismatch_panel,
+            text=f"Version mismatch.\nServer: {server_text}\nClient: {client_text}",
+            text_fg=(0.94, 0.96, 0.98, 1),
+            text_scale=0.034,
+            frameColor=(0, 0, 0, 0),
+            pos=(0, 0, 0.02),
+        )
+        DirectButton(
+            parent=self.version_mismatch_panel,
+            text="OK",
+            text_scale=0.036,
+            frameSize=(-0.16, 0.16, -0.055, 0.055),
+            frameColor=(0.24, 0.29, 0.34, 1),
+            text_fg=(1, 1, 1, 1),
+            pos=(0, 0, -0.22),
+            command=self._quit_after_kick,
+        )
+        self._set_status("Version mismatch")
+
+    def _clear_all_modal_panels(self) -> None:
+        self.taskMgr.remove("neko-mouse-world-editor-wait")
+        self.taskMgr.remove(WORLD_LOAD_TASK_NAME)
+        self.taskMgr.remove(STARTUP_MAXIMIZE_TASK_NAME)
+        self.taskMgr.remove("neko-mouse-world-console-refocus")
+        self._unbind_console_entry_change_events()
+        for panel_name in (
+            "help_panel",
+            "quit_panel",
+            "focus_pause_panel",
+            "disconnect_panel",
+            "console_panel",
+            "connect_panel",
+            "editor_wait_panel",
+            "loading_panel",
+            "kicked_panel",
+            "connect_refused_panel",
+            "version_mismatch_panel",
+        ):
+            panel = getattr(self, panel_name, None)
+            if panel is not None:
+                panel.destroy()
+                setattr(self, panel_name, None)
+        self.disconnect_message = None
+        self.console_log_labels = []
+        self.console_entry = None
+        self.console_send_button = None
+        self.console_input_scrollbar = None
+        self.console_input_scroll_thumb = None
+        self.console_input_scroll_buttons = []
+        self.console_entry_event_names = []
+        self.console_entry_wrapped_line_count = 1
+        self.console_scrollbar = None
+        self.console_scroll_thumb = None
+        self.connect_host_entry = None
+        self.connect_port_entry = None
+        self.connect_error_label = None
+        self.quit_button_frames = {}
+        self.quit_buttons = {}
+
+    def _quit_after_kick(self) -> None:
+        raise SystemExit
+
     def _open_console(self) -> None:
         if self.ui_open or self.modal_mode is not None or self.world_load_job is not None:
             return
         if self.network_client is None:
             self._set_status("Server console is available only in client/server mode")
             return
-        self.console_logs = list(self.network_client.server_logs[-CONSOLE_LOG_LIMIT:])
-        self.console_scroll_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
+        self._load_console_logs_from_network()
         self.ui_open = True
         self.modal_mode = "console"
         self._clear_movement_keys()
@@ -2356,28 +3182,19 @@ class NekoMouseWorldApp(ShowBase):
             frameSize=(-1.02, 0.94, -0.49, 0.52),
             pos=(-0.02, 0, 0.04),
         )
-        self.console_log_label = DirectLabel(
-            parent=self.console_panel,
-            text="",
-            text_fg=(0.82, 0.90, 0.86, 1),
-            text_scale=0.026,
-            text_align=0,
-            frameColor=(0, 0, 0, 0),
-            pos=(-1.00, 0, 0.50),
-        )
-        self.console_scrollbar = DirectScrollBar(
-            parent=self.console_panel,
-            orientation="vertical",
-            range=(0, max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)),
-            value=self.console_scroll_offset,
-            pageSize=CONSOLE_VISIBLE_LINES,
-            scrollSize=1,
-            frameSize=(-0.03, 0.03, -0.50, 0.50),
-            frameColor=(0.13, 0.15, 0.18, 1),
-            thumb_frameColor=(0.42, 0.48, 0.55, 1),
-            pos=(0.99, 0, 0.04),
-            command=self._console_scroll_changed,
-        )
+        self.console_log_labels = []
+        for index in range(CONSOLE_VISIBLE_LINES):
+            label = DirectLabel(
+                parent=self.console_panel,
+                text="",
+                text_fg=(0.82, 0.90, 0.86, 1),
+                text_scale=0.026,
+                text_align=0,
+                frameColor=(0, 0, 0, 0),
+                pos=(-1.00, 0, 0.50 - index * 0.052),
+            )
+            self.console_log_labels.append(label)
+        self._make_console_scrollbar()
         self.console_entry = DirectEntry(
             parent=self.console_panel,
             initialText="",
@@ -2385,22 +3202,31 @@ class NekoMouseWorldApp(ShowBase):
             frameColor=(0.13, 0.15, 0.18, 1),
             text_fg=(1, 1, 1, 1),
             frameSize=(-0.02, 1.52, -0.052, 0.052),
-            pos=(-1.02, 0, -0.62),
-            numLines=1,
+            pos=(-1.02, 0, CONSOLE_INPUT_CENTER_Z),
+            width=CONSOLE_INPUT_WRAP_WIDTH,
+            numLines=CONSOLE_INPUT_MIN_LINES,
             focus=1,
+            backgroundFocus=1,
+            overflow=0,
             command=lambda _text: self._send_console_command(),
         )
-        DirectButton(
+        self.console_entry.guiItem.setMaxChars(CONSOLE_COMMAND_MAX_CHARS)
+        self.console_entry.onscreenText.textNode.setWordwrap(CONSOLE_INPUT_WRAP_WIDTH)
+        self._bind_console_entry_change_events()
+        self.console_send_button = DirectButton(
             parent=self.console_panel,
             text="Send",
             text_scale=0.033,
             frameSize=(-0.14, 0.14, -0.052, 0.052),
             frameColor=(0.24, 0.29, 0.34, 1),
             text_fg=(1, 1, 1, 1),
-            pos=(0.92, 0, -0.62),
+            pos=(0.92, 0, CONSOLE_INPUT_CENTER_Z),
             command=self._send_console_command,
         )
+        self._make_console_input_scrollbar()
+        self._update_console_entry_layout()
         self._refresh_console_log_view()
+        self._refocus_console_entry()
         self._set_status("Server console")
 
     def _make_console_close_button(self) -> None:
@@ -2425,12 +3251,21 @@ class NekoMouseWorldApp(ShowBase):
         icon.reparentTo(button)
 
     def _close_console(self) -> None:
+        self.taskMgr.remove("neko-mouse-world-console-refocus")
+        self._unbind_console_entry_change_events()
         if self.console_panel is not None:
             self.console_panel.destroy()
         self.console_panel = None
-        self.console_log_label = None
+        self.console_log_labels = []
         self.console_entry = None
+        self.console_send_button = None
+        self.console_input_scrollbar = None
+        self.console_input_scroll_thumb = None
+        self.console_input_scroll_buttons = []
+        self.console_entry_event_names = []
+        self.console_entry_wrapped_line_count = 1
         self.console_scrollbar = None
+        self.console_scroll_thumb = None
         self.ui_open = False
         self.modal_mode = None
         self._clear_movement_keys()
@@ -2442,44 +3277,333 @@ class NekoMouseWorldApp(ShowBase):
             return
         command = self.console_entry.get().strip()
         if not command:
+            self._refocus_console_entry()
             return
         self.console_entry.enterText("")
         if self.network_client is None or not self.network_client.connected:
-            self._append_console_log(f"not connected: {command}")
+            self._append_console_log({"line": f"not connected: {command}", "stream": "stderr"})
+            self._refocus_console_entry()
             return
         self.network_client.send_server_command(command)
+        self._update_console_entry_layout()
+        self._refocus_console_entry()
 
-    def _append_console_log(self, line: str) -> None:
-        if line:
-            self.console_logs.append(line)
+    def _bind_console_entry_change_events(self) -> None:
+        if self.console_entry is None:
+            return
+        self._unbind_console_entry_change_events()
+        self.console_entry_event_names = [
+            self.console_entry.guiItem.getTypeEvent(),
+            self.console_entry.guiItem.getEraseEvent(),
+            self.console_entry.guiItem.getCursormoveEvent(),
+            self.console_entry.guiItem.getOverflowEvent(),
+        ]
+        for event_name in self.console_entry_event_names:
+            self.accept(event_name, self._on_console_entry_changed)
+
+    def _on_console_entry_changed(self, *_args) -> None:
+        self._update_console_entry_layout()
+
+    def _unbind_console_entry_change_events(self) -> None:
+        for event_name in self.console_entry_event_names:
+            self.ignore(event_name)
+        self.console_entry_event_names = []
+
+    def _update_console_entry_layout(self) -> None:
+        if self.modal_mode != "console" or self.console_entry is None:
+            return
+        text = self.console_entry.get()
+        wrapped_lines = self._console_entry_wrapped_lines(text)
+        line_count = max(CONSOLE_INPUT_MIN_LINES, len(wrapped_lines))
+        visible_lines = max(CONSOLE_INPUT_MIN_LINES, min(CONSOLE_INPUT_MAX_LINES, line_count))
+        if self.console_entry["numLines"] != visible_lines:
+            self.console_entry["numLines"] = visible_lines
+        height = CONSOLE_INPUT_BASE_HEIGHT + (visible_lines - 1) * CONSOLE_INPUT_LINE_STEP
+        center_z = CONSOLE_INPUT_BOTTOM + height * 0.5
+        self.console_entry["frameSize"] = (-0.02, 1.52, -height * 0.5, height * 0.5)
+        self.console_entry.setZ(center_z)
+        if self.console_send_button is not None:
+            self.console_send_button.setZ(center_z)
+        self.console_entry_wrapped_line_count = line_count
+        self._update_console_input_scrollbar(line_count, visible_lines)
+
+    def _console_entry_wrapped_lines(self, text: str) -> list[str]:
+        if not text:
+            return [""]
+        lines: list[str] = []
+        for raw_line in text.splitlines() or [""]:
+            line = raw_line or ""
+            while len(line) > CONSOLE_INPUT_WRAP_CHARS:
+                lines.append(line[:CONSOLE_INPUT_WRAP_CHARS])
+                line = line[CONSOLE_INPUT_WRAP_CHARS:]
+            lines.append(line)
+        if text.endswith("\n"):
+            lines.append("")
+        return lines
+
+    def _console_entry_cursor_line(self) -> int:
+        if self.console_entry is None:
+            return 0
+        text = self.console_entry.get()
+        cursor = max(0, min(len(text), self.console_entry.getCursorPosition()))
+        return max(0, len(self._console_entry_wrapped_lines(text[:cursor])) - 1)
+
+    def _make_console_input_scrollbar(self) -> None:
+        if self.console_panel is None:
+            return
+        self.console_input_scrollbar = DirectFrame(
+            parent=self.console_panel,
+            frameColor=(0.10, 0.12, 0.15, 1),
+            frameSize=(-0.010, 0.010, -0.052, 0.052),
+            pos=(CONSOLE_INPUT_SCROLL_X, 0, CONSOLE_INPUT_CENTER_Z),
+        )
+        self.console_input_scroll_thumb = DirectFrame(
+            parent=self.console_input_scrollbar,
+            frameColor=(0.48, 0.54, 0.62, 1),
+            frameSize=(-0.014, 0.014, -0.020, 0.020),
+        )
+        self.console_input_scroll_buttons = [
+            DirectButton(
+                parent=self.console_panel,
+                text="^",
+                text_scale=0.018,
+                frameSize=(-0.018, 0.018, -0.018, 0.018),
+                frameColor=(0.18, 0.21, 0.25, 1),
+                text_fg=(0.95, 0.97, 1, 1),
+                pos=(CONSOLE_INPUT_SCROLL_X, 0, CONSOLE_INPUT_CENTER_Z + 0.034),
+                command=self._scroll_console_input_lines,
+                extraArgs=[-1],
+            ),
+            DirectButton(
+                parent=self.console_panel,
+                text="v",
+                text_scale=0.018,
+                frameSize=(-0.018, 0.018, -0.018, 0.018),
+                frameColor=(0.18, 0.21, 0.25, 1),
+                text_fg=(0.95, 0.97, 1, 1),
+                pos=(CONSOLE_INPUT_SCROLL_X, 0, CONSOLE_INPUT_CENTER_Z - 0.034),
+                command=self._scroll_console_input_lines,
+                extraArgs=[1],
+            ),
+        ]
+
+    def _scroll_console_input_lines(self, delta: int) -> None:
+        if self.console_entry is None:
+            return
+        cursor = self.console_entry.getCursorPosition()
+        target = max(0, min(self.console_entry_wrapped_line_count - 1, self._console_entry_cursor_line() + delta))
+        self.console_entry.setCursorPosition(self._console_entry_position_for_wrapped_line(target, cursor))
+        self._update_console_entry_layout()
+        self._refocus_console_entry()
+
+    def _console_entry_position_for_wrapped_line(self, target_line: int, fallback: int) -> int:
+        if self.console_entry is None:
+            return fallback
+        text = self.console_entry.get()
+        if target_line <= 0:
+            return 0
+        current_line = 0
+        column = 0
+        for index, character in enumerate(text):
+            if current_line >= target_line:
+                return index
+            column += 1
+            if character == "\n" or column >= CONSOLE_INPUT_WRAP_CHARS:
+                current_line += 1
+                column = 0
+        return len(text)
+
+    def _update_console_input_scrollbar(self, line_count: int, visible_lines: int) -> None:
+        if self.console_input_scrollbar is None or self.console_input_scroll_thumb is None:
+            return
+        height = CONSOLE_INPUT_BASE_HEIGHT + (visible_lines - 1) * CONSOLE_INPUT_LINE_STEP
+        center_z = CONSOLE_INPUT_BOTTOM + height * 0.5
+        self.console_input_scrollbar.setZ(center_z)
+        self.console_input_scrollbar["frameSize"] = (-0.010, 0.010, -height * 0.5, height * 0.5)
+        if self.console_input_scroll_buttons:
+            self.console_input_scroll_buttons[0].setZ(center_z + height * 0.5 - 0.018)
+            self.console_input_scroll_buttons[1].setZ(center_z - height * 0.5 + 0.018)
+        should_show = line_count > visible_lines
+        if not should_show:
+            self.console_input_scrollbar.hide()
+            for button in self.console_input_scroll_buttons:
+                button.hide()
+            return
+        self.console_input_scrollbar.show()
+        for button in self.console_input_scroll_buttons:
+            button.show()
+        visible_fraction = min(1.0, visible_lines / max(1, line_count))
+        thumb_height = max(CONSOLE_INPUT_SCROLL_THUMB_MIN_HEIGHT, height * visible_fraction)
+        travel = max(0.0, height - thumb_height)
+        max_offset = max(1, line_count - visible_lines)
+        cursor_line = min(max_offset, self._console_entry_cursor_line())
+        offset_fraction = cursor_line / max_offset
+        thumb_center = height * 0.5 - thumb_height * 0.5 - travel * offset_fraction
+        self.console_input_scroll_thumb["frameSize"] = (-0.014, 0.014, -thumb_height * 0.5, thumb_height * 0.5)
+        self.console_input_scroll_thumb.setZ(thumb_center)
+
+    def _append_console_log(self, entry: object) -> None:
+        if not self.permissions.get("allow_cmd", True):
+            self._set_console_permission_denied()
+            return
+        normalized = self._normalize_console_log_entry(entry)
+        if normalized["line"]:
+            self.console_logs.append(normalized)
             self.console_logs = self.console_logs[-CONSOLE_LOG_LIMIT:]
         if self.modal_mode == "console":
             max_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
-            at_bottom = self.console_scrollbar is None or int(round(float(self.console_scrollbar["value"]))) >= max_offset - 1
+            at_bottom = self.console_scroll_offset >= max_offset - 1
             if at_bottom:
                 self.console_scroll_offset = max_offset
             self._refresh_console_log_view()
 
-    def _console_scroll_changed(self) -> None:
-        if self.console_scrollbar is None:
+    def _make_console_scrollbar(self) -> None:
+        if self.console_panel is None:
             return
-        try:
-            self.console_scroll_offset = int(round(float(self.console_scrollbar["value"])))
-        except (TypeError, ValueError):
-            self.console_scroll_offset = 0
-        self._refresh_console_log_view(update_scrollbar=False)
+        DirectButton(
+            parent=self.console_panel,
+            text="^",
+            text_scale=0.026,
+            frameSize=(-0.035, 0.035, -0.030, 0.030),
+            frameColor=(0.18, 0.21, 0.25, 1),
+            text_fg=(0.95, 0.97, 1, 1),
+            pos=(CONSOLE_SCROLL_X, 0, CONSOLE_SCROLL_TRACK_TOP + 0.045),
+            command=self._scroll_console_lines,
+            extraArgs=[-1],
+        )
+        DirectButton(
+            parent=self.console_panel,
+            text="v",
+            text_scale=0.026,
+            frameSize=(-0.035, 0.035, -0.030, 0.030),
+            frameColor=(0.18, 0.21, 0.25, 1),
+            text_fg=(0.95, 0.97, 1, 1),
+            pos=(CONSOLE_SCROLL_X, 0, CONSOLE_SCROLL_TRACK_BOTTOM - 0.045),
+            command=self._scroll_console_lines,
+            extraArgs=[1],
+        )
+        self.console_scrollbar = DirectFrame(
+            parent=self.console_panel,
+            frameColor=(0.13, 0.15, 0.18, 1),
+            frameSize=(-0.018, 0.018, CONSOLE_SCROLL_TRACK_BOTTOM, CONSOLE_SCROLL_TRACK_TOP),
+            pos=(CONSOLE_SCROLL_X, 0, 0),
+        )
+        midpoint = (CONSOLE_SCROLL_TRACK_TOP + CONSOLE_SCROLL_TRACK_BOTTOM) * 0.5
+        DirectButton(
+            parent=self.console_panel,
+            text="",
+            frameSize=(-0.018, 0.018, midpoint, CONSOLE_SCROLL_TRACK_TOP),
+            frameColor=(0, 0, 0, 0),
+            pos=(CONSOLE_SCROLL_X, 0, 0),
+            command=self._scroll_console_lines,
+            extraArgs=[-CONSOLE_VISIBLE_LINES],
+        )
+        DirectButton(
+            parent=self.console_panel,
+            text="",
+            frameSize=(-0.018, 0.018, CONSOLE_SCROLL_TRACK_BOTTOM, midpoint),
+            frameColor=(0, 0, 0, 0),
+            pos=(CONSOLE_SCROLL_X, 0, 0),
+            command=self._scroll_console_lines,
+            extraArgs=[CONSOLE_VISIBLE_LINES],
+        )
+        self.console_scroll_thumb = DirectFrame(
+            parent=self.console_panel,
+            frameColor=(0.42, 0.48, 0.55, 1),
+            frameSize=(-0.024, 0.024, -0.04, 0.04),
+            pos=(CONSOLE_SCROLL_X, 0, 0),
+        )
 
-    def _refresh_console_log_view(self, update_scrollbar: bool = True) -> None:
+    def _scroll_console_wheel(self, delta: int) -> None:
+        if self.modal_mode == "console":
+            self._scroll_console_lines(delta)
+
+    def _scroll_console_lines(self, delta: int) -> None:
+        if self.modal_mode != "console":
+            return
+        max_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
+        self.console_scroll_offset = max(0, min(max_offset, self.console_scroll_offset + delta))
+        self._refresh_console_log_view()
+        self._refocus_console_entry()
+
+    def _refresh_console_log_view(self) -> None:
         max_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
         self.console_scroll_offset = max(0, min(self.console_scroll_offset, max_offset))
-        if self.console_scrollbar is not None:
-            self.console_scrollbar["range"] = (0, max_offset)
-            self.console_scrollbar["pageSize"] = CONSOLE_VISIBLE_LINES
-            if update_scrollbar:
-                self.console_scrollbar["value"] = self.console_scroll_offset
-        if self.console_log_label is not None:
+        self._position_console_scroll_thumb()
+        if self.console_log_labels:
             visible = self.console_logs[self.console_scroll_offset : self.console_scroll_offset + CONSOLE_VISIBLE_LINES]
-            self.console_log_label["text"] = "\n".join(visible)
+            for index, label in enumerate(self.console_log_labels):
+                if index < len(visible):
+                    entry = visible[index]
+                    label["text"] = entry["line"]
+                    label["text_fg"] = (1.0, 0.42, 0.38, 1) if entry["stream"] == "stderr" else (0.82, 0.90, 0.86, 1)
+                else:
+                    label["text"] = ""
+
+    def _refocus_console_entry(self) -> None:
+        if self.modal_mode != "console" or self.console_entry is None:
+            return
+        try:
+            self.console_entry["focus"] = 1
+            self.console_entry.focusIn()
+        except Exception:
+            return
+        self.taskMgr.remove("neko-mouse-world-console-refocus")
+        self.taskMgr.doMethodLater(0.01, self._refocus_console_entry_task, "neko-mouse-world-console-refocus")
+
+    def _refocus_console_entry_task(self, task):
+        if self.modal_mode == "console" and self.console_entry is not None:
+            try:
+                self.console_entry["focus"] = 1
+                self.console_entry.focusIn()
+            except Exception:
+                pass
+        return task.done
+
+    def _normalize_console_log_entry(self, entry: object) -> dict[str, str]:
+        if isinstance(entry, dict):
+            line = str(entry.get("line", ""))
+            stream = "stderr" if str(entry.get("stream", "stdout")) == "stderr" else "stdout"
+            return {"line": line, "stream": stream}
+        return {"line": str(entry), "stream": "stdout"}
+
+    def _load_console_logs_from_network(self) -> None:
+        if self.network_client is None or not self.permissions.get("allow_cmd", True):
+            self._set_console_permission_denied(refresh=False)
+            return
+        self.console_logs = [self._normalize_console_log_entry(entry) for entry in self.network_client.server_logs[-CONSOLE_LOG_LIMIT:]]
+        self.console_scroll_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
+
+    def _set_console_permission_denied(self, message: str = SERVER_LOG_PERMISSION_DENIED_LINE, refresh: bool = True) -> None:
+        self.console_logs = [{"line": message or SERVER_LOG_PERMISSION_DENIED_LINE, "stream": "stderr"}]
+        self.console_scroll_offset = 0
+        if refresh and self.modal_mode == "console":
+            self._refresh_console_log_view()
+
+    def _apply_server_log_permission(self, allowed: bool, message: str = SERVER_LOG_PERMISSION_DENIED_LINE) -> None:
+        if not allowed:
+            self._set_console_permission_denied(message)
+        elif self.modal_mode == "console" and self.network_client is not None:
+            self.console_logs = [
+                self._normalize_console_log_entry(entry)
+                for entry in self.network_client.server_logs[-CONSOLE_LOG_LIMIT:]
+            ]
+            self.console_scroll_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
+            self._refresh_console_log_view()
+
+    def _position_console_scroll_thumb(self) -> None:
+        if self.console_scroll_thumb is None:
+            return
+        total = max(1, len(self.console_logs))
+        visible_fraction = min(1.0, CONSOLE_VISIBLE_LINES / total)
+        track_height = CONSOLE_SCROLL_TRACK_TOP - CONSOLE_SCROLL_TRACK_BOTTOM
+        thumb_height = max(CONSOLE_SCROLL_THUMB_MIN_HEIGHT, track_height * visible_fraction)
+        travel = max(0.0, track_height - thumb_height)
+        max_offset = max(0, len(self.console_logs) - CONSOLE_VISIBLE_LINES)
+        offset_fraction = 0.0 if max_offset == 0 else self.console_scroll_offset / max_offset
+        thumb_center = CONSOLE_SCROLL_TRACK_TOP - thumb_height * 0.5 - travel * offset_fraction
+        self.console_scroll_thumb["frameSize"] = (-0.024, 0.024, -thumb_height * 0.5, thumb_height * 0.5)
+        self.console_scroll_thumb.setZ(thumb_center)
 
     def _focus_editor_if_waiting(self) -> None:
         if self.modal_mode != "editor_wait" or self.editor_process is None:
@@ -2604,7 +3728,10 @@ class NekoMouseWorldApp(ShowBase):
         self.connect_required = False
         self.ui_open = False
         self.modal_mode = None
-        self.network_client = NetworkWorldClient(host, port)
+        self.network_client = NetworkWorldClient(host, port, desired_user_id=self.default_user_id)
+        self.network_spawn_pos = None
+        self.network_client_loaded_sent = False
+        self.permissions = dict(self.network_client.permissions)
         self.paths = self.network_client.paths
         self.surface_cache = BoxSurfaceCache(self.paths.boxes_dir)
         self.collision_cache = CollisionShapeCache(self.paths.boxes_dir)
@@ -2630,7 +3757,7 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status("Ready")
 
     def _open_focus_pause(self) -> None:
-        if self.modal_mode in {"editor_wait", "quit", "console"}:
+        if self.modal_mode in {"editor_wait", "quit", "console", "kicked", "connect_refused", "version_mismatch"}:
             return
         if self.modal_mode == "focus_pause":
             self._position_focus_pause_panel()
@@ -2709,6 +3836,9 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status("Ready")
 
     def _release_mouse_capture(self) -> None:
+        if self.modal_mode in {"kicked", "connect_refused", "version_mismatch"}:
+            self._quit_after_kick()
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.world_load_job is not None:
@@ -2780,7 +3910,16 @@ class NekoMouseWorldApp(ShowBase):
     def _check_foreground_pause(self) -> None:
         if self.world_load_job is not None:
             return
-        if self.modal_mode in {"editor_wait", "quit"}:
+        if self.modal_mode in {
+            "editor_wait",
+            "quit",
+            "help",
+            "console",
+            "connect",
+            "kicked",
+            "connect_refused",
+            "version_mismatch",
+        }:
             return
         if not self._window_has_foreground():
             self._open_focus_pause()
@@ -2799,6 +3938,9 @@ class NekoMouseWorldApp(ShowBase):
         self._request_quit()
 
     def _request_quit(self) -> None:
+        if self.modal_mode in {"kicked", "connect_refused", "version_mismatch"}:
+            self._quit_after_kick()
+            return
         if self.modal_mode == "editor_wait":
             self._focus_editor_if_waiting()
             return
@@ -2914,6 +4056,9 @@ class NekoMouseWorldApp(ShowBase):
             frame["frameColor"] = (1.0, 0.88, 0.18, 1.0) if choice == self.active_quit_choice else (0.18, 0.21, 0.25, 1)
 
     def _submit_modal(self) -> None:
+        if self.modal_mode in {"kicked", "connect_refused", "version_mismatch"}:
+            self._quit_after_kick()
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.modal_mode == "help":
@@ -3031,6 +4176,48 @@ def make_checker_ground_patch(origin_x: int, origin_y: int, size: int) -> NodePa
     path = NodePath(node)
     path.setLightOff()
     return path
+
+
+def _panda_window_hwnd(window) -> int | None:
+    if window is None or not hasattr(window, "getWindowHandle"):
+        return None
+    try:
+        handle = window.getWindowHandle()
+    except Exception:
+        return None
+    if handle is None:
+        return None
+    for method_name in ("getIntHandle", "get_int_handle"):
+        method = getattr(handle, method_name, None)
+        if method is None:
+            continue
+        try:
+            hwnd = int(method())
+        except (TypeError, ValueError):
+            continue
+        if hwnd > 0:
+            return hwnd
+    return None
+
+
+def _maximize_windows_hwnd(hwnd: int) -> bool:
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_ancestor = user32.GetAncestor
+        get_ancestor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+        get_ancestor.restype = ctypes.c_void_p
+        show_window = user32.ShowWindow
+        show_window.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        show_window.restype = ctypes.c_bool
+        is_zoomed = user32.IsZoomed
+        is_zoomed.argtypes = (ctypes.c_void_p,)
+        is_zoomed.restype = ctypes.c_bool
+        root = int(get_ancestor(ctypes.c_void_p(hwnd), 2) or hwnd)
+        target = ctypes.c_void_p(root)
+        show_window(target, 3)
+        return bool(is_zoomed(target))
+    except Exception:
+        return False
 
 
 def focus_process_window(pid: int) -> None:

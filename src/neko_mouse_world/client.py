@@ -7,14 +7,27 @@ import tempfile
 
 from .app import NekoMouseWorldApp
 from .client_net import NetworkWorldClient
+from .net_protocol import is_valid_user_id
 from .server import DEFAULT_HOST, DEFAULT_PORT
 from .world_file import LoadedWorld, WorldMap, world_paths
+
+
+def _user_id_argument(value: str) -> str:
+    if value and not is_valid_user_id(value):
+        raise argparse.ArgumentTypeError("--user-id may contain only letters, digits, underscores, and hyphens")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Neko Mouse World multiplayer client")
     parser.add_argument("--host", default=None, help="server TCP host")
     parser.add_argument("--port", default=None, type=int, help="server TCP port")
+    parser.add_argument(
+        "--user-id",
+        default="",
+        type=_user_id_argument,
+        help="requested user ID; letters, digits, underscores, and hyphens only",
+    )
     return parser
 
 
@@ -37,11 +50,12 @@ def main(argv: list[str] | None = None) -> int:
                 show_connect_dialog=True,
                 default_connect_host=DEFAULT_HOST,
                 default_connect_port=DEFAULT_PORT,
+                default_user_id=args.user_id,
             )
         else:
             host = args.host or DEFAULT_HOST
             port = args.port if args.port is not None else DEFAULT_PORT
-            network_client = NetworkWorldClient(host, port)
+            network_client = NetworkWorldClient(host, port, desired_user_id=args.user_id)
             loaded_world = LoadedWorld(paths=network_client.paths, world_map=network_client.world_map)
             app = NekoMouseWorldApp(loaded_world, network_client=network_client)
         app.run()

@@ -12,6 +12,7 @@ authors = [{ name = "GGN_2015" }]
 dependencies = [
     "box-editor-view>=0.1.8",
     "panda3d>=1.10.14",
+    "pip"
 ]
 
 [project.scripts]

@@ -2,4 +2,6 @@
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.0"
+from .version import get_neko_mouse_world_version
+
+__version__ = get_neko_mouse_world_version()

@@ -35,11 +35,16 @@ Use the project virtual environment:
 
 ```powershell
 venv\Scripts\python.exe -m neko_mouse_world.server path\to\world-folder --host 127.0.0.1 --port 5678
-venv\Scripts\python.exe -m neko_mouse_world.client --host 127.0.0.1 --port 5678
+venv\Scripts\python.exe -m neko_mouse_world.client --host 127.0.0.1 --port 5678 --user-id neko
 ```
 
 If the client is started without `--host` and `--port`, it opens a modal
 connection dialog first. Fill in the server host and TCP port, then press OK.
+The optional `--user-id` asks the server for a human-readable user ID. If that
+ID is already online, the server appends `_1`, `_2`, and so on; when there is no
+conflict, the requested ID is used as-is. Client-requested IDs may contain only
+ASCII letters, digits, underscores, and hyphens. If the client does not request
+an ID, the server assigns the first unused positive integer string.
 
 The world path is a folder. When `info.world` or `boxes/` is missing, the editor
 creates them automatically. If `info.world` exists but is malformed, startup
@@ -52,13 +57,35 @@ venv\Scripts\python.exe -m neko_mouse_world.server path\to\world-folder --with-c
 ```
 
 In `--with-client` mode the server runs in the background, launches one client
-connected to itself, and shuts down when that main client exits.
+connected to itself, and shuts down when that main client exits. The main local
+client requests the default user ID `root`.
 
 The server accepts `--udp-host` and `--udp-port`. The default UDP port is `0`,
 which means the OS chooses a free port. The selected UDP endpoint is negotiated
 over TCP. World/map changes always use TCP. Player positions first try UDP; the
 client sends 5 probe packets and UDP is used only when at least 3 probes succeed.
 If the test fails, player positions automatically fall back to TCP.
+
+The server also accepts `--pin <secret>`. Any connected client may run a
+top-level `pin("secret")` from the server console, even when command permission
+is currently disabled for that player; this is the only command allowed without
+`allow_cmd`. When it matches, the server grants that player
+`allow_cmd(..., true)`. Running `pin(...)` while already allowed is harmless, and
+a wrong secret does not remove existing command permission. Submitted pin values
+are redacted from server stdout, stderr, and the in-game log.
+
+New client permissions default to the server environment variables
+`DEFAULT_SET`, `DEFAULT_FLY`, `DEFAULT_BREAK`, and `DEFAULT_CMD`. Each defaults
+to true and accepts values such as `true`/`false`, `1`/`0`, `yes`/`no`, or
+`on`/`off`. These variables are read only when a client joins; changing them
+later affects future clients, not players who are already connected.
+Set the server environment variable `DISPLAY_USER_ID` to `true` or `false` to
+control whether all clients show other players' user IDs above their heads.
+Changing it with `setenv("DISPLAY_USER_ID", false)` or `true` broadcasts the
+new display setting to connected clients over TCP.
+Set `ALLOW_CONNECT` to `false` to refuse new client handshakes. Refused clients
+show `Server do not allow connect. (ALLOW_CONNECT = False)`, stop retrying, and
+exit after the user clicks OK or closes the window.
 
 During startup, the main TCP connection receives the world snapshot and an asset
 manifest. Missing `.box` assets are then downloaded over temporary parallel TCP
@@ -67,6 +94,9 @@ channels close after startup, leaving only the main TCP connection. Configure
 the count with `--startup-asset-channels`; use `1` to effectively disable
 parallel startup asset transfer. If those temporary channels fail, the client
 reconnects and falls back to inline asset transfer on the main TCP connection.
+The server also sends its `neko_mouse_world` package version during the initial
+handshake. If the client package version is different, the client shows a
+version mismatch dialog with both versions and exits instead of reconnecting.
 
 The server saves world changes immediately. When the last client disconnects, it
 also removes `.box` files from `boxes/` that are no longer referenced by the
@@ -97,6 +127,11 @@ venv\Scripts\python.exe -m box_editor_view --hash some.box
 If `info.world` references a missing `.box` file, that world cell is removed on
 load and the repaired world file is saved.
 
+The server also stores each `user_id`'s last known player position in
+`info.world`. On the next login, that saved position is negotiated during the
+TCP welcome handshake; if the saved spot is blocked, only `z` is adjusted to the
+highest usable surface in the same world-grid column.
+
 `.box` color alpha follows `box-editor-view`: alpha `0` is not empty. It is
 rendered as an opaque RGB cube and acts as an RGB-colored point light source.
 The client keeps realtime point lighting capped to nearby/in-view light cubes;
@@ -111,6 +146,8 @@ is transparent, and alpha `255` is opaque.
 - Walk mode `Space`: jump 1.1 world units.
 - Fly mode `Space` / `Shift`: move up / down.
 - Right click: place the selected `.box`.
+- When placing is allowed, the player's right hand shows the selected `.box`.
+  Other players can also see that held `.box` in multiplayer.
 - Left click: delete the targeted world box.
 - `Z`: restore the last world box you deleted.
 - Middle click: select the targeted world box type and orientation.
@@ -124,8 +161,16 @@ is transparent, and alpha `255` is opaque.
 - `H`: show help.
 - `Esc`: release the mouse and show exit choices.
 
+The server command console is available in client/server mode when no other
+modal window is open. Type a command in the bottom input and press `Enter` or
+click `Send` to send it to the server. Close the console with its top-right `X`
+button or `Esc`. See [Server Command Console](docs/server-command-console.md)
+for permissions, server logs, environment variables, and the command reference.
+
 Placing, deleting, selecting, editing, and hover highlighting only work within
 10 world units of the player.
+The server `allow_set` permission controls placing, editing, restoring, and
+rotating existing boxes.
 
 World boxes collide using the convex hull of their `.box` voxel vertices, not a
 full cube. In walk mode the player can step up onto obstacles up to 0.5 world

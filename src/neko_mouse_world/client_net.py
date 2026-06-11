@@ -14,7 +14,15 @@ from typing import Any
 from box_editor_view.box_file import BoxFormatError
 
 from .box_assets import store_box_file_by_hash
-from .net_protocol import decode_file_base64, encode_file_base64, list_to_cell, send_socket_message
+from .net_protocol import (
+    SERVER_LOG_PERMISSION_DENIED_LINE,
+    decode_file_base64,
+    encode_file_base64,
+    is_valid_user_id,
+    list_to_cell,
+    send_socket_message,
+)
+from .version import get_neko_mouse_world_version
 from .world_file import Cell, WorldFormatError, WorldMap, box_path_for_hash, world_paths
 
 
@@ -22,23 +30,40 @@ UDP_PROBE_INTERVAL = 0.10
 UDP_PROBE_SETTLE_SECONDS = 0.50
 DEFAULT_STARTUP_ASSET_CHANNELS = 4
 PLAYER_STATE_SEND_INTERVAL = 0.05
+ServerLogEntry = dict[str, str]
+DEFAULT_PERMISSIONS: dict[str, bool] = {
+    "allow_set": True,
+    "allow_fly": True,
+    "allow_break": True,
+    "allow_cmd": True,
+}
+DEFAULT_CLIENT_CONFIG: dict[str, bool] = {
+    "display_user_id": True,
+}
 
 
 @dataclass(frozen=True)
 class RemotePlayer:
     player_id: int
+    user_id: str
     pos: tuple[float, float, float]
     velocity: tuple[float, float, float]
     heading: float
     pitch: float
     move_mode: str
+    held_hash: str
+    held_orientation: int
+    held_visible: bool
     received_at: float
 
 
 class NetworkWorldClient:
-    def __init__(self, host: str, port: int, cache_dir: Path | None = None) -> None:
+    def __init__(self, host: str, port: int, cache_dir: Path | None = None, desired_user_id: str = "") -> None:
         self.host = host
         self.port = port
+        self.desired_user_id = str(desired_user_id or "").strip()
+        if self.desired_user_id and not is_valid_user_id(self.desired_user_id):
+            raise ValueError("desired user ID may contain only letters, digits, underscores, and hyphens")
         cache_root = cache_dir or (Path(tempfile.gettempdir()) / "neko_mouse_world_client_cache" / f"{host}_{port}")
         self.paths = world_paths(cache_root)
         self.paths.root.mkdir(parents=True, exist_ok=True)
@@ -48,10 +73,21 @@ class NetworkWorldClient:
         self.client_uuid = uuid.uuid4().hex
         self.connected = False
         self.connecting = True
+        self.kicked = False
+        self.kick_reason = ""
+        self.connect_refused = False
+        self.connect_refused_reason = ""
+        self.version_mismatch = False
+        self.client_version = get_neko_mouse_world_version()
+        self.server_version = ""
         self.player_id: int | None = None
+        self.user_id = ""
+        self.spawn_pos: tuple[float, float, float] | None = None
         self.default_hash: str | None = None
         self.world_map = WorldMap()
-        self.server_logs: list[str] = []
+        self.permissions: dict[str, bool] = dict(DEFAULT_PERMISSIONS)
+        self.client_config: dict[str, bool] = dict(DEFAULT_CLIENT_CONFIG)
+        self.server_logs: list[ServerLogEntry] = []
         self.remote_players: dict[int, RemotePlayer] = {}
         self._remote_lock = threading.RLock()
         self.udp_host = host
@@ -109,6 +145,69 @@ class NetworkWorldClient:
         except OSError:
             pass
 
+    def close_after_kick(self) -> None:
+        self.kicked = True
+        self._stop.set()
+        self.connected = False
+        self.connecting = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            self._udp_socket.close()
+        except OSError:
+            pass
+
+    def close_after_connect_refused(self) -> None:
+        self.connect_refused = True
+        self._stop.set()
+        self.connected = False
+        self.connecting = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            self._udp_socket.close()
+        except OSError:
+            pass
+
+    def close_after_version_mismatch(self) -> None:
+        self.version_mismatch = True
+        self._stop.set()
+        self.connected = False
+        self.connecting = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            self._udp_socket.close()
+        except OSError:
+            pass
+
     def send_place(self, cell: Cell, digest: str, orientation: int, include_asset: bool = False) -> None:
         self._enqueue_tcp(
             {
@@ -140,6 +239,34 @@ class NetworkWorldClient:
     def send_server_command(self, command: str) -> None:
         self._enqueue_tcp({"type": "server_command", "command": command})
 
+    def send_client_loaded(
+        self,
+        pos: tuple[float, float, float],
+        velocity: tuple[float, float, float],
+        heading: float,
+        pitch: float,
+        move_mode: str,
+        held_hash: str = "",
+        held_orientation: int = 0,
+        held_visible: bool = False,
+    ) -> None:
+        if self.player_id is None:
+            return
+        self._enqueue_tcp(
+            {
+                "type": "client_loaded",
+                "player_id": self.player_id,
+                "pos": [pos[0], pos[1], pos[2]],
+                "velocity": [velocity[0], velocity[1], velocity[2]],
+                "heading": heading,
+                "pitch": pitch,
+                "move_mode": move_mode,
+                "held_hash": str(held_hash or ""),
+                "held_orientation": int(held_orientation),
+                "held_visible": bool(held_visible and held_hash),
+            }
+        )
+
     def send_player_state(
         self,
         pos: tuple[float, float, float],
@@ -147,6 +274,9 @@ class NetworkWorldClient:
         heading: float,
         pitch: float,
         move_mode: str,
+        held_hash: str = "",
+        held_orientation: int = 0,
+        held_visible: bool = False,
     ) -> None:
         if self.player_id is None:
             return
@@ -158,9 +288,23 @@ class NetworkWorldClient:
             "heading": heading,
             "pitch": pitch,
             "move_mode": move_mode,
+            "held_hash": str(held_hash or ""),
+            "held_orientation": int(held_orientation),
+            "held_visible": bool(held_visible and held_hash),
         }
         with self._latest_player_state_lock:
             self._latest_player_state = message
+
+    def send_held_item(self, digest: str, orientation: int, visible: bool, include_asset: bool = False) -> None:
+        self._enqueue_tcp(
+            {
+                "type": "held_item",
+                "hash": str(digest or ""),
+                "orientation": int(orientation),
+                "visible": bool(visible and digest),
+                "_attach_asset": include_asset,
+            }
+        )
 
     def asset_payload(self, digest: str) -> str | None:
         path = box_path_for_hash(self.paths.boxes_dir, digest)
@@ -222,6 +366,7 @@ class NetworkWorldClient:
                         "type": "hello",
                         "protocol": 2,
                         "client_uuid": self.client_uuid,
+                        "desired_user_id": self.desired_user_id,
                         "include_assets": self._prefer_inline_startup_assets,
                     },
                 )
@@ -229,7 +374,11 @@ class NetworkWorldClient:
             except (OSError, ValueError, ConnectionError):
                 pass
             finally:
-                self._mark_disconnected()
+                if self._terminal_disconnect:
+                    self.connected = False
+                    self.connecting = False
+                else:
+                    self._mark_disconnected()
                 sock = self._sock
                 self._sock = None
                 if sock is not None:
@@ -237,15 +386,28 @@ class NetworkWorldClient:
                         sock.close()
                     except OSError:
                         pass
-                if not self._stop.is_set():
+                if not self._stop.is_set() and not self._terminal_disconnect:
                     self.incoming.put({"type": "disconnect"})
+            if self._terminal_disconnect:
+                break
             time.sleep(1.0)
 
+    @property
+    def _terminal_disconnect(self) -> bool:
+        return self.kicked or self.connect_refused or self.version_mismatch
+
     def _mark_disconnected(self) -> None:
+        if self._terminal_disconnect:
+            self.connected = False
+            self.connecting = False
+            self._clear_latest_player_state()
+            return
         self.connected = False
         self.connecting = True
         self._startup_asset_generation += 1
         self.player_id = None
+        self.user_id = ""
+        self.spawn_pos = None
         self.udp_host = self.host
         self.udp_port = None
         self.udp_enabled = False
@@ -262,6 +424,7 @@ class NetworkWorldClient:
             self._udp_acks.clear()
         with self._runtime_asset_lock:
             self._runtime_asset_downloads.clear()
+        self._clear_latest_player_state()
 
     def _read_loop(self, sock: socket.socket) -> None:
         buffer = bytearray()
@@ -277,6 +440,15 @@ class NetworkWorldClient:
                     continue
                 message = json.loads(line.decode("utf-8"))
                 if isinstance(message, dict):
+                    if message.get("type") == "kicked":
+                        self._handle_kicked(sock, message)
+                        return
+                    if message.get("type") == "connect_refused":
+                        self._handle_connect_refused(sock, message)
+                        return
+                    if message.get("type") == "welcome" and self._welcome_version_mismatch(message):
+                        self._handle_version_mismatch(sock, message)
+                        return
                     self._handle_incoming(message)
 
     def _udp_read_loop(self) -> None:
@@ -331,6 +503,9 @@ class NetworkWorldClient:
     def _handle_incoming(self, message: dict[str, Any]) -> None:
         message_type = message.get("type")
         if message_type == "welcome":
+            if self._welcome_version_mismatch(message):
+                self._handle_version_mismatch(None, message)
+                return
             self._apply_welcome(message)
             self.incoming.put({"type": "welcome"})
             return
@@ -352,10 +527,54 @@ class NetworkWorldClient:
             self._apply_player_state(message)
             return
         elif message_type == "server_log":
-            line = str(message.get("line", ""))
-            self.server_logs.append(line)
+            if not self.permissions.get("allow_cmd", True):
+                return
+            entry = self._normalize_server_log(message)
+            self.server_logs.append(entry)
             self.server_logs = self.server_logs[-300:]
-            self.incoming.put({"type": "server_log", "line": line})
+            self.incoming.put({"type": "server_log", **entry})
+            return
+        elif message_type == "kicked":
+            self._handle_kicked(None, message)
+            return
+        elif message_type == "connect_refused":
+            self._handle_connect_refused(None, message)
+            return
+        elif message_type == "version_mismatch":
+            self._handle_version_mismatch(None, message)
+            return
+        elif message_type == "teleport":
+            pos = message.get("pos")
+            if isinstance(pos, list) and len(pos) == 3:
+                self.incoming.put({"type": "teleport", "pos": pos})
+            return
+        elif message_type == "permissions":
+            self.permissions = self._normalize_permissions(message.get("permissions"))
+            if not self.permissions.get("allow_cmd", True):
+                self.server_logs = []
+            self.incoming.put({"type": "permissions", "permissions": dict(self.permissions)})
+            return
+        elif message_type == "server_log_permission":
+            allowed = bool(message.get("allowed"))
+            logs = message.get("logs", [])
+            if allowed and isinstance(logs, list):
+                self.server_logs = [self._normalize_server_log(item) for item in logs][-300:]
+            elif not allowed:
+                self.server_logs = []
+            self.incoming.put(
+                {
+                    "type": "server_log_permission",
+                    "allowed": allowed,
+                    "message": str(message.get("message", SERVER_LOG_PERMISSION_DENIED_LINE)),
+                }
+            )
+            return
+        elif message_type == "client_config":
+            self.client_config = self._normalize_client_config(message)
+            self.incoming.put({"type": "client_config", "client_config": dict(self.client_config)})
+            return
+        elif message_type == "force_move_mode":
+            self.incoming.put({"type": "force_move_mode", "move_mode": str(message.get("move_mode", "walk"))})
             return
         elif message_type == "player_left":
             try:
@@ -366,17 +585,80 @@ class NetworkWorldClient:
             return
         self.incoming.put(message)
 
+    def _handle_kicked(self, sock: socket.socket | None, message: dict[str, Any]) -> None:
+        reason = str(message.get("reason", ""))
+        self.kicked = True
+        self.kick_reason = reason
+        self.connected = False
+        self.connecting = False
+        try:
+            if sock is not None:
+                send_socket_message(sock, {"type": "kick_ack"})
+        except OSError:
+            pass
+        self.incoming.put({"type": "kicked", "reason": reason, "by": str(message.get("by", ""))})
+        self._stop.set()
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _handle_connect_refused(self, sock: socket.socket | None, message: dict[str, Any]) -> None:
+        reason = str(message.get("reason", "Server do not allow connect. (ALLOW_CONNECT = False)"))
+        self.connect_refused = True
+        self.connect_refused_reason = reason
+        self.connected = False
+        self.connecting = False
+        self.incoming.put({"type": "connect_refused", "reason": reason})
+        self._stop.set()
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _welcome_version_mismatch(self, message: dict[str, Any]) -> bool:
+        server_version = str(message.get("server_version", "")).strip()
+        client_version = str(self.client_version or get_neko_mouse_world_version()).strip()
+        return not server_version or server_version != client_version
+
+    def _handle_version_mismatch(self, sock: socket.socket | None, message: dict[str, Any]) -> None:
+        self.server_version = str(message.get("server_version", "")).strip() or "unknown"
+        self.client_version = str(self.client_version or get_neko_mouse_world_version()).strip() or "unknown"
+        self.version_mismatch = True
+        self.connected = False
+        self.connecting = False
+        self.incoming.put(
+            {
+                "type": "version_mismatch",
+                "server_version": self.server_version,
+                "client_version": self.client_version,
+            }
+        )
+        self._stop.set()
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
     def _apply_welcome(self, message: dict[str, Any]) -> None:
+        self._clear_latest_player_state()
         self.player_id = int(message["player_id"])
+        self.user_id = str(message.get("user_id", self.player_id))
+        self.spawn_pos = self._normalize_spawn_pos(message.get("spawn_pos"))
         self.default_hash = str(message["default_hash"])
+        self.permissions = self._normalize_permissions(message.get("permissions"))
+        self.client_config = self._normalize_client_config(message.get("client_config"))
         for asset in message.get("assets", []):
             self._store_asset(str(asset.get("hash", "")), str(asset.get("data", "")))
         if message.get("assets"):
             self._prefer_inline_startup_assets = False
 
         logs = message.get("logs", [])
-        if isinstance(logs, list):
-            self.server_logs = [str(line) for line in logs][-300:]
+        if self.permissions.get("allow_cmd", True) and bool(message.get("server_log_allowed", True)) and isinstance(logs, list):
+            self.server_logs = [self._normalize_server_log(item) for item in logs][-300:]
         else:
             self.server_logs = []
 
@@ -440,6 +722,37 @@ class NetworkWorldClient:
             if not path.is_file():
                 missing.append(digest)
         return missing
+
+    def _normalize_server_log(self, item: object) -> ServerLogEntry:
+        if isinstance(item, dict):
+            line = str(item.get("line", ""))
+            stream = "stderr" if str(item.get("stream", "stdout")) == "stderr" else "stdout"
+            return {"line": line, "stream": stream}
+        return {"line": str(item), "stream": "stdout"}
+
+    def _normalize_permissions(self, value: object) -> dict[str, bool]:
+        permissions = dict(DEFAULT_PERMISSIONS)
+        if isinstance(value, dict):
+            for key in permissions:
+                if key in value:
+                    permissions[key] = bool(value[key])
+        return permissions
+
+    def _normalize_client_config(self, value: object) -> dict[str, bool]:
+        config = dict(DEFAULT_CLIENT_CONFIG)
+        if isinstance(value, dict):
+            for key in config:
+                if key in value:
+                    config[key] = bool(value[key])
+        return config
+
+    def _normalize_spawn_pos(self, value: object) -> tuple[float, float, float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            return None
+        try:
+            return (float(value[0]), float(value[1]), float(value[2]))
+        except (TypeError, ValueError):
+            return None
 
     def _start_parallel_startup_assets(
         self,
@@ -678,13 +991,23 @@ class NetworkWorldClient:
             pitch = float(message.get("pitch", 0.0))
         except (TypeError, ValueError):
             return
+        held_hash = str(message.get("held_hash", ""))
+        try:
+            held_orientation = int(message.get("held_orientation", 0))
+        except (TypeError, ValueError):
+            held_orientation = 0
+        held_visible = bool(message.get("held_visible")) and bool(held_hash)
         player = RemotePlayer(
             player_id=player_id,
+            user_id=str(message.get("user_id", player_id)),
             pos=pos_tuple,
             velocity=velocity_tuple,
             heading=heading,
             pitch=pitch,
             move_mode=str(message.get("move_mode", "walk")),
+            held_hash=held_hash,
+            held_orientation=held_orientation,
+            held_visible=held_visible,
             received_at=time.monotonic(),
         )
         with self._remote_lock:
@@ -704,6 +1027,10 @@ class NetworkWorldClient:
             state = self._latest_player_state
             self._latest_player_state = None
             return state
+
+    def _clear_latest_player_state(self) -> None:
+        with self._latest_player_state_lock:
+            self._latest_player_state = None
 
     def _send_player_state_now(self, message: dict[str, Any]) -> None:
         if self.udp_enabled and self.udp_port is not None:

@@ -16,7 +16,12 @@ from box_editor_view.box_file import BoxMap, RGBA, save_box
 from box_editor_view.box_hash import box_hash
 
 from neko_mouse_world.box_assets import ensure_default_box
-from neko_mouse_world.world_file import Cell, WorldMap, save_world, world_paths
+from neko_mouse_world.world_file import Cell, PlayerPosition, WorldMap, save_world, world_paths
+
+
+SHOWCASE_SPAWN_X = 0.5
+SHOWCASE_SPAWN_Y = -25.5
+SHOWCASE_SPAWN_USER_IDS = ("root", "1")
 
 
 def rgba(red: int, green: int, blue: int, alpha: int = 255) -> RGBA:
@@ -118,6 +123,16 @@ def store_asset(boxes_dir: Path, box_map: BoxMap) -> str:
     if not target.exists():
         save_box(target, box_map)
     return digest
+
+
+def coarse_spawn_position(world: WorldMap, x: float = SHOWCASE_SPAWN_X, y: float = SHOWCASE_SPAWN_Y) -> PlayerPosition:
+    column_x = math.floor(x)
+    column_y = math.floor(y)
+    z = max(
+        (cell[2] + 1 for cell in world.boxes if cell[0] == column_x and cell[1] == column_y),
+        default=0,
+    )
+    return (float(x), float(y), float(z))
 
 
 def build_showcase(output: Path) -> None:
@@ -295,10 +310,13 @@ def build_showcase(output: Path) -> None:
     for x, y in [(-9, -22), (8, -23), (-17, -13), (17, -12), (-10, 22), (10, 22)]:
         put((x, y, 0), assets["bank"], overwrite=False)
 
-    save_world(paths.info_file, world)
+    spawn = coarse_spawn_position(world)
+    player_positions = {user_id: spawn for user_id in SHOWCASE_SPAWN_USER_IDS}
+    save_world(paths.info_file, world, player_positions)
     print(f"Wrote {paths.root}")
     print(f"World boxes: {len(world.boxes)}")
     print(f"Reusable .box assets: {len(list(paths.boxes_dir.glob('*.box')))}")
+    print(f"Player spawn: {spawn} for {', '.join(SHOWCASE_SPAWN_USER_IDS)}")
 
 
 def main() -> int:

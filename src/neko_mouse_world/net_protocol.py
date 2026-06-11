@@ -3,11 +3,18 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+import re
 import socket
 from typing import Any, BinaryIO
 
 
 Message = dict[str, Any]
+USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+SERVER_LOG_PERMISSION_DENIED_LINE = "server log: permission denied, use pin('PIN-CONTENT') to retrive admin access."
+
+
+def is_valid_user_id(value: str) -> bool:
+    return bool(USER_ID_PATTERN.fullmatch(value))
 
 
 def send_message(file: BinaryIO, message: Message) -> None:
