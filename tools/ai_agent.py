@@ -80,6 +80,12 @@ For any build or movement request:
 JsonObject = dict[str, Any]
 
 
+class ContextWindowExceeded(RuntimeError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AI-controlled Neko Mouse World client agent")
     parser.add_argument("--host", required=True, help="server TCP host")
@@ -219,6 +225,8 @@ class ResponsesClient:
                 return body
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
+                if self._is_context_window_error(detail):
+                    raise ContextWindowExceeded(detail[:1600]) from exc
                 if self._should_retry_http(exc.code, attempt):
                     last_error = RuntimeError(f"HTTP {exc.code}: {detail[:1600]}")
                     self._retry_sleep(attempt, f"HTTP {exc.code}", keep_running)
@@ -272,6 +280,10 @@ class ResponsesClient:
         if self._is_timeout(value):
             return True
         return isinstance(value, (ConnectionError, OSError))
+
+    def _is_context_window_error(self, detail: str) -> bool:
+        lowered = detail.lower()
+        return "context window" in lowered or "input exceeds" in lowered
 
 
 @dataclass
@@ -1020,11 +1032,7 @@ class AgentCoordinator:
                 if not self.is_current(generation):
                     return
                 print(f"[agent] requesting Responses model ({self.client.model})...", flush=True)
-                response = self.client.create(
-                    input_items,
-                    self._tool_schemas,
-                    keep_running=lambda generation=generation: self.is_current(generation),
-                )
+                response = self._create_with_context_recovery(input_items, generation, instruction)
                 output = response.get("output", [])
                 if not isinstance(output, list):
                     raise RuntimeError(f"Responses output was not a list: {json_preview(response)}")
@@ -1122,6 +1130,36 @@ class AgentCoordinator:
     def _user_message(self, content: list[JsonObject]) -> JsonObject:
         return {"role": "user", "content": content}
 
+    def _create_with_context_recovery(
+        self,
+        input_items: list[JsonObject],
+        generation: int,
+        instruction: str,
+    ) -> JsonObject:
+        shrink_count = 0
+        while self.is_current(generation):
+            try:
+                return self.client.create(
+                    input_items,
+                    self._tool_schemas,
+                    keep_running=lambda generation=generation: self.is_current(generation),
+                )
+            except ContextWindowExceeded as exc:
+                shrink_count += 1
+                before = len(input_items)
+                next_items = shrink_response_input_items(input_items)
+                if len(json.dumps(next_items, ensure_ascii=False)) >= len(json.dumps(input_items, ensure_ascii=False)):
+                    raise RuntimeError(f"Responses input still exceeds context window after compaction: {exc.detail}") from exc
+                input_items[:] = next_items
+                message = localized_status(
+                    instruction,
+                    f"\u4e0a\u6e38\u6a21\u578b\u63d0\u793a\u4e0a\u4e0b\u6587\u8d85\u9650\uff0c\u6211\u5df2\u7ecf\u81ea\u52a8\u538b\u7f29\u4e0a\u4e0b\u6587\u5e76\u4fdd\u7559\u521d\u59cb\u6307\u4ee4\u4e0e\u6700\u8fd1\u8fdb\u5ea6\uff0c\u7b2c {shrink_count} \u6b21\u7ee7\u7eed\u5c1d\u8bd5\u3002",
+                    f"The upstream model said the context window was exceeded. I compacted context while preserving the initial instruction and recent progress, then retried ({shrink_count}).",
+                )
+                print(f"AI: {message}", flush=True)
+                print(f"[agent] compacted Responses input {before} -> {len(input_items)} items.", flush=True)
+        raise RuntimeError("Responses request was interrupted by a newer user instruction")
+
     def _record_assistant_text(self, generation: int, text: str) -> None:
         clean = " ".join(text.strip().split())
         if not clean:
@@ -1138,6 +1176,97 @@ def strip_private_fields(value: Any) -> Any:
     if isinstance(value, list):
         return [strip_private_fields(item) for item in value]
     return value
+
+
+def shrink_response_input_items(input_items: list[JsonObject]) -> list[JsonObject]:
+    if not input_items:
+        return []
+    first = compact_input_item(input_items[0], keep_images=False)
+    tail_count = max(1, len(input_items) // 2)
+    tail = [compact_input_item(item, keep_images=True) for item in input_items[-tail_count:]]
+    result = [first]
+    if tail and tail[0] == first:
+        result.extend(tail[1:])
+    else:
+        result.extend(tail)
+    keep_last_image(result)
+    result.insert(
+        1,
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Context was compacted because the upstream model reported that the "
+                        "input exceeded its context window. Preserve the original user goal, "
+                        "continue from the recent retained tool results, and ask for a fresh "
+                        "screenshot if visual detail is missing."
+                    ),
+                }
+            ],
+        },
+    )
+    return result
+
+
+def compact_input_item(item: Any, keep_images: bool = False) -> JsonObject:
+    compacted = strip_private_fields(item)
+    if not isinstance(compacted, dict):
+        return {"role": "user", "content": [{"type": "input_text", "text": str(compacted)[:4000]}]}
+    if compacted.get("type") == "function_call_output":
+        output = compacted.get("output")
+        if isinstance(output, str) and len(output) > 2500:
+            compacted = dict(compacted)
+            compacted["output"] = output[:2500] + "...<truncated>"
+        return compacted
+    content = compacted.get("content")
+    if isinstance(content, list):
+        compacted = dict(compacted)
+        compacted["content"] = compact_content_parts(content, keep_images=keep_images)
+    return compacted
+
+
+def compact_content_parts(content: list[Any], keep_images: bool = False) -> list[JsonObject]:
+    compacted: list[JsonObject] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "input_image":
+            if keep_images:
+                compacted.append(part)
+            continue
+        if part_type in {"input_text", "output_text", "text"}:
+            text = str(part.get("text", ""))
+            next_part = dict(part)
+            if len(text) > 6000:
+                next_part["text"] = text[:6000] + "...<truncated>"
+            compacted.append(next_part)
+            continue
+        compacted.append(part)
+    if not compacted:
+        compacted.append({"type": "input_text", "text": "<compacted empty message>"})
+    return compacted
+
+
+def keep_last_image(input_items: list[JsonObject]) -> None:
+    last_image: JsonObject | None = None
+    for item in input_items:
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        images = [part for part in content if isinstance(part, dict) and part.get("type") == "input_image"]
+        if images:
+            last_image = images[-1]
+        item["content"] = [part for part in content if not (isinstance(part, dict) and part.get("type") == "input_image")]
+    if last_image is None:
+        return
+    for item in reversed(input_items):
+        content = item.get("content")
+        if isinstance(content, list):
+            content.append(last_image)
+            return
 
 
 def localized_status(instruction: str, zh: str, en: str) -> str:

@@ -33,6 +33,10 @@ without repeating the asset payload for every block.
 The prompt and tool schema also tell the agent to move near a target fill region
 and look at it before calling `fill_region`, then inspect the result with a
 screenshot from nearby.
+If the upstream model reports that the input exceeds its context window, the
+agent compacts its Responses input automatically: it keeps the original user
+instruction, keeps the most recent half of the retained messages, drops old
+screenshots except the newest one, and retries.
 
 Useful options:
 
