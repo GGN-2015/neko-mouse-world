@@ -1026,19 +1026,23 @@ class NekoMouseWorldApp(ShowBase):
 
     def _sync_remote_player_held_item(self, render: _RemotePlayerRender, player: RemotePlayer) -> None:
         key = (player.held_hash, int(player.held_orientation)) if player.held_visible and player.held_hash else None
-        if key == render.held_key:
+        if key == render.held_key and render.held_model is not None:
             return
-        if render.held_model is not None:
-            render.held_model.removeNode()
-            render.held_model = None
-        render.held_key = key
         if key is None:
+            if render.held_model is not None:
+                render.held_model.removeNode()
+                render.held_model = None
+            render.held_key = None
             render.held_anchor.hide()
             return
         template = self._remote_held_model_template(key)
         if template is None:
-            render.held_anchor.hide()
+            if render.held_model is None:
+                render.held_anchor.hide()
             return
+        if render.held_model is not None:
+            render.held_model.removeNode()
+            render.held_model = None
         model = template.copyTo(render.held_anchor)
         model.setPos(0, 0, 0)
         model.setScale(0.30)
@@ -1046,6 +1050,7 @@ class NekoMouseWorldApp(ShowBase):
         model.setDepthTest(True)
         model.show()
         render.held_model = model
+        render.held_key = key
         render.held_anchor.show()
 
     def _remote_held_model_template(self, key: tuple[str, int]) -> NodePath | None:
@@ -1089,9 +1094,6 @@ class NekoMouseWorldApp(ShowBase):
                 self.remote_held_model_templates[key] = template
                 self._trim_remote_held_model_templates()
                 built += 1
-            for render in self.remote_player_nodes.values():
-                if render.held_key == key and render.held_model is None:
-                    render.held_key = None
             if built >= REMOTE_HELD_MODEL_BUILDS_PER_FRAME or time.perf_counter() >= deadline:
                 break
 
