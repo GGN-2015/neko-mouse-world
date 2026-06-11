@@ -16,6 +16,13 @@ layered roofs.
 
 ![Castle aerial view](docs/images/castle_overlook.png)
 
+## Installation
+
+```bash
+python -m venv venv
+venv\Scripts\python.exe -m pip install neko-mouse-world --upgrade
+```
+
 Open the showcase world in single-player mode:
 
 ```powershell
