@@ -462,6 +462,7 @@ class NekoMouseWorldApp(ShowBase):
         model.setScale(0.42)
         model.setHpr(28, -24, 12)
         model.setDepthTest(True)
+        model.setLightOff()
         self.held_item_model = model
         self.held_item_root.show()
 
@@ -493,6 +494,7 @@ class NekoMouseWorldApp(ShowBase):
         model.setScale(0.30)
         model.setHpr(28, -24, 12)
         model.setDepthTest(True)
+        model.setLightOff()
         model.show()
         self.third_person_held_model = model
         self.third_person_held_anchor.show()
@@ -826,6 +828,12 @@ class NekoMouseWorldApp(ShowBase):
             elif message_type == "asset":
                 digest = str(message.get("hash", ""))
                 if self.world_load_job is None:
+                    try:
+                        asset_ready = self.network_client is None or self.network_client.asset_path(digest).is_file()
+                    except WorldFormatError:
+                        asset_ready = False
+                    if asset_ready:
+                        continue
                     self.pending_asset_digests.add(digest)
                     if digest == self.selected_hash:
                         self._refresh_held_item(force=True)
@@ -1066,6 +1074,7 @@ class NekoMouseWorldApp(ShowBase):
         model.setScale(0.30)
         model.setHpr(28, -24, 12)
         model.setDepthTest(True)
+        model.setLightOff()
         model.show()
         render.held_model = model
         render.held_key = key
@@ -2367,7 +2376,6 @@ class NekoMouseWorldApp(ShowBase):
             self.pending_asset_digests.discard(digest)
             self.surface_cache.invalidate(digest)
             self.collision_cache.invalidate(digest)
-            self._invalidate_remote_held_model_templates(digest)
             self._mark_chunks_dirty_for_digest(digest)
             waiting = self.waiting_asset_world_messages.pop(digest, [])
             if waiting:

@@ -89,6 +89,13 @@ New client permissions default to the server environment variables
 to true and accepts values such as `true`/`false`, `1`/`0`, `yes`/`no`, or
 `on`/`off`. These variables are read only when a client joins; changing them
 later affects future clients, not players who are already connected.
+You can set initial values at server startup with repeated `--setenv` options,
+for example:
+
+```powershell
+venv\Scripts\python.exe -m neko_mouse_world.server path\to\world-folder --setenv DEFAULT_FLY=false --setenv DEFAULT_SET=false
+```
+
 Set the server environment variable `DISPLAY_USER_ID` to `true` or `false` to
 control whether all clients show other players' user IDs above their heads.
 Changing it with `setenv("DISPLAY_USER_ID", false)` or `true` broadcasts the

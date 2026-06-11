@@ -85,6 +85,7 @@ SERVER_COMMAND_HELP = (
     "  allow_cmd(user_id, true/false): allow using server commands and viewing server logs\n"
     "  DEFAULT_SET/DEFAULT_FLY/DEFAULT_BREAK/DEFAULT_CMD: environment defaults for new clients\n"
     "    default true; accepts true/false, 1/0, yes/no, on/off; existing clients are unchanged\n"
+    "    startup also accepts repeated --setenv NAME=value options before clients join\n"
     "  DISPLAY_USER_ID: show/hide user ID labels above remote players; setenv updates clients live\n"
     "  ALLOW_CONNECT: when false, new clients are refused during handshake\n"
     "  client --user-id accepts letters, digits, underscores, and hyphens only\n"
@@ -181,6 +182,19 @@ def _environment_bool(name: str, default: bool) -> bool:
     if normalized in ENV_FALSE_VALUES:
         return False
     return default
+
+
+def _apply_startup_setenv(values: list[str] | None) -> None:
+    if not values:
+        return
+    for value in values:
+        name, separator, env_value = value.partition("=")
+        if not separator:
+            raise ValueError("--setenv must use NAME=value syntax")
+        name = name.strip()
+        if not name:
+            raise ValueError("--setenv variable name cannot be empty")
+        os.environ[name] = env_value
 
 
 def _print_traceback(context: str) -> None:
@@ -1770,6 +1784,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--udp-port", default=0, type=int, help="UDP port to bind; 0 auto-allocates")
     parser.add_argument("--pin", default=None, help="server command unlock secret; never written to server logs")
     parser.add_argument(
+        "--setenv",
+        action="append",
+        default=[],
+        metavar="NAME=value",
+        help="set an initial server environment variable; may be used multiple times",
+    )
+    parser.add_argument(
         "--startup-asset-channels",
         default=DEFAULT_STARTUP_ASSET_CHANNELS,
         type=int,
@@ -1782,6 +1803,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        _apply_startup_setenv(args.setenv)
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         state = WorldServerState(Path(args.world))
     except WorldFormatError as exc:

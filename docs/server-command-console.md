@@ -99,6 +99,13 @@ Each variable accepts `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`.
 The values are read only when a client joins, so changing them affects future
 clients but not players who are already online.
 
+Initial values can also be supplied when starting the server with repeated
+`--setenv NAME=value` options. For example:
+
+```powershell
+venv\Scripts\python.exe -m neko_mouse_world.server path\to\world-folder --setenv DEFAULT_FLY=false --setenv DEFAULT_SET=false --setenv DEFAULT_BREAK=false --setenv DEFAULT_CMD=false
+```
+
 ## Client Display Environment
 
 `DISPLAY_USER_ID` controls whether clients draw online user IDs above other
