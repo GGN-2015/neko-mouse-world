@@ -101,6 +101,7 @@ JUMP_HEIGHT = 1.1
 JUMP_SPEED = math.sqrt(2.0 * GRAVITY * JUMP_HEIGHT)
 STANDING_TOLERANCE = 0.10
 STEP_HEIGHT = 0.5
+GROUND_CONTACT_PROBE = 0.08
 FOOT_PROBE_FORWARD = PLAYER_WIDTH * 0.25
 MAX_INTERACTION_DISTANCE = 10.0
 GROUND_SIZE = 160
@@ -119,6 +120,7 @@ PLAYER_INPUT_IDLE_SYNC_DELAY = 0.25
 REMOTE_PLAYER_PREDICTION_SECONDS = 1.0
 REMOTE_HELD_TEMPLATE_CACHE_LIMIT = 96
 REMOTE_HELD_MODEL_BUILDS_PER_FRAME = 1
+REMOTE_HELD_CLEAR_GRACE_SECONDS = 0.35
 STARTUP_MAXIMIZE_RETRY_SECONDS = 1.0
 STARTUP_MAXIMIZE_RETRY_INTERVAL = 0.10
 STARTUP_MAXIMIZE_TASK_NAME = "neko-mouse-world-startup-maximize"
@@ -172,6 +174,7 @@ class _RemotePlayerRender:
     held_anchor: NodePath
     held_model: NodePath | None
     held_key: tuple[str, int] | None
+    held_clear_started: float | None
     phase: float
     last_update: float
 
@@ -392,7 +395,6 @@ class NekoMouseWorldApp(ShowBase):
         self._add_player_part("right-arm", (0.18, 0.22, 0.72), (0.37, 0, 1.08), (0.10, 0.34, 0.88, 1))
         self._add_player_part("left-leg", (0.20, 0.24, 0.78), (-0.13, 0, 0.39), (0.12, 0.18, 0.42, 1))
         self._add_player_part("right-leg", (0.20, 0.24, 0.78), (0.13, 0, 0.39), (0.12, 0.18, 0.42, 1))
-        self.player_model.setTransparency(TransparencyAttrib.MAlpha)
         self.third_person_held_anchor = self.player_model.attachNewNode("third-person-held-anchor")
         self.third_person_held_anchor.setPos(0.48, -0.14, 0.78)
         self.third_person_held_anchor.setHpr(18, -12, -8)
@@ -561,7 +563,6 @@ class NekoMouseWorldApp(ShowBase):
         name_label.setLightOff()
         name_label.setDepthWrite(False)
         name_label.setTransparency(TransparencyAttrib.MAlpha)
-        root.setTransparency(TransparencyAttrib.MAlpha)
         return _RemotePlayerRender(
             root=root,
             limbs=limbs,
@@ -569,6 +570,7 @@ class NekoMouseWorldApp(ShowBase):
             held_anchor=held_anchor,
             held_model=None,
             held_key=None,
+            held_clear_started=None,
             phase=0.0,
             last_update=time.monotonic(),
         )
@@ -742,7 +744,7 @@ class NekoMouseWorldApp(ShowBase):
             return
         self.key_state["up"] = True
         self._mark_player_input_active()
-        if self.move_mode == "walk" and self.grounded:
+        if self.move_mode == "walk" and self._can_jump_from_current_position():
             self.vertical_velocity = JUMP_SPEED
             self.grounded = False
 
@@ -975,6 +977,8 @@ class NekoMouseWorldApp(ShowBase):
         if render.held_model is not None:
             render.held_model.removeNode()
             render.held_model = None
+        render.held_key = None
+        render.held_clear_started = None
         render.root.removeNode()
 
     def _sync_remote_player_labels(self) -> None:
@@ -1027,14 +1031,28 @@ class NekoMouseWorldApp(ShowBase):
     def _sync_remote_player_held_item(self, render: _RemotePlayerRender, player: RemotePlayer) -> None:
         key = (player.held_hash, int(player.held_orientation)) if player.held_visible and player.held_hash else None
         if key == render.held_key and render.held_model is not None:
+            render.held_clear_started = None
+            render.held_anchor.show()
             return
         if key is None:
-            if render.held_model is not None:
-                render.held_model.removeNode()
-                render.held_model = None
+            if render.held_model is None:
+                render.held_key = None
+                render.held_clear_started = None
+                render.held_anchor.hide()
+                return
+            now = time.monotonic()
+            if render.held_clear_started is None:
+                render.held_clear_started = now
+                return
+            if now - render.held_clear_started < REMOTE_HELD_CLEAR_GRACE_SECONDS:
+                return
+            render.held_model.removeNode()
+            render.held_model = None
             render.held_key = None
+            render.held_clear_started = None
             render.held_anchor.hide()
             return
+        render.held_clear_started = None
         template = self._remote_held_model_template(key)
         if template is None:
             if render.held_model is None:
@@ -1099,8 +1117,15 @@ class NekoMouseWorldApp(ShowBase):
 
     def _trim_remote_held_model_templates(self) -> None:
         while len(self.remote_held_model_templates) > REMOTE_HELD_TEMPLATE_CACHE_LIMIT:
-            key, template = next(iter(self.remote_held_model_templates.items()))
-            self.remote_held_model_templates.pop(key, None)
+            active_keys = {
+                render.held_key
+                for render in self.remote_player_nodes.values()
+                if render.held_key is not None and render.held_model is not None
+            }
+            key = next((candidate for candidate in self.remote_held_model_templates if candidate not in active_keys), None)
+            if key is None:
+                break
+            template = self.remote_held_model_templates.pop(key)
             template.removeNode()
             for render in self.remote_player_nodes.values():
                 if render.held_key == key:
@@ -1108,6 +1133,7 @@ class NekoMouseWorldApp(ShowBase):
                         render.held_model.removeNode()
                         render.held_model = None
                     render.held_key = None
+                    render.held_clear_started = None
 
     def _update_player_velocity(self, previous_pos: Vec3, dt: float) -> None:
         if dt <= 1e-6:
@@ -1206,6 +1232,7 @@ class NekoMouseWorldApp(ShowBase):
         return globalClock.getFrameTime() - self.last_player_input_time >= PLAYER_INPUT_IDLE_SYNC_DELAY
 
     def _update_player(self, dt: float, allow_input: bool = True) -> None:
+        ignored_blockers = self._current_player_overlap_cells()
         heading_rad = math.radians(self.heading)
         forward = Vec3(-math.sin(heading_rad), math.cos(heading_rad), 0)
         right = Vec3(math.cos(heading_rad), math.sin(heading_rad), 0)
@@ -1237,23 +1264,30 @@ class NekoMouseWorldApp(ShowBase):
                 self.vertical_velocity -= GRAVITY * dt
             desired.z += self.vertical_velocity * dt
 
-        self._move_player_with_collision(desired)
+        self._move_player_with_collision(desired, ignored_blockers)
         if self.move_mode == "walk":
-            self.grounded = (
-                self.vertical_velocity <= 0.0
-                and self._support_height_below(self.player_pos, STANDING_TOLERANCE) is not None
-            )
+            snapped = False
+            if self.vertical_velocity <= 0.0:
+                support = self._support_height_below(self.player_pos, STEP_HEIGHT + STANDING_TOLERANCE)
+                if (
+                    support is not None
+                    and support >= self.player_pos.z - STANDING_TOLERANCE
+                    and support <= self.player_pos.z + STEP_HEIGHT + STANDING_TOLERANCE
+                ):
+                    self.player_pos.z = support
+                    snapped = True
+            self.grounded = self.vertical_velocity <= 0.0 and (snapped or self._has_walk_contact(self.player_pos))
             if self.grounded and self.vertical_velocity < 0.0:
                 self.vertical_velocity = 0.0
         self.player_model.setPos(self.player_pos)
         self.player_model.setH(self.heading)
 
-    def _move_player_with_collision(self, movement: Vec3) -> None:
+    def _move_player_with_collision(self, movement: Vec3, ignored_blockers: set[Cell] | None = None) -> None:
         for component in (Vec3(movement.x, 0, 0), Vec3(0, movement.y, 0), Vec3(0, 0, movement.z)):
             if component.lengthSquared() == 0:
                 continue
             if component.z == 0.0 and self._can_snap_to_walk_support():
-                if self._try_walk_horizontal(component):
+                if self._try_walk_horizontal(component, ignored_blockers):
                     continue
             candidate = self.player_pos + component
             if candidate.z < 0.0:
@@ -1262,7 +1296,7 @@ class NekoMouseWorldApp(ShowBase):
                     self.vertical_velocity = 0.0
                     self.grounded = True
                 continue
-            collision_top = self._blocking_top_for_player(candidate)
+            collision_top = self._blocking_top_for_player(candidate, ignored_cells=ignored_blockers)
             if collision_top is None:
                 if (component.x != 0.0 or component.y != 0.0) and self._can_snap_to_walk_support():
                     support = self._support_height_below(candidate, STEP_HEIGHT + STANDING_TOLERANCE)
@@ -1275,7 +1309,7 @@ class NekoMouseWorldApp(ShowBase):
                 climb_limit = self.player_pos.z + STEP_HEIGHT + STANDING_TOLERANCE
                 if collision_top <= climb_limit:
                     stepped = Vec3(candidate.x, candidate.y, collision_top)
-                    if self._blocking_top_for_player(stepped) is None:
+                    if self._blocking_top_for_player(stepped, ignored_cells=ignored_blockers) is None:
                         self.player_pos = stepped
                         self.vertical_velocity = 0.0
                         self.grounded = True
@@ -1293,23 +1327,50 @@ class NekoMouseWorldApp(ShowBase):
     def _can_snap_to_walk_support(self) -> bool:
         return self.move_mode == "walk" and self.grounded and self.vertical_velocity <= 0.0
 
-    def _try_walk_horizontal(self, component: Vec3) -> bool:
+    def _try_walk_horizontal(self, component: Vec3, ignored_blockers: set[Cell] | None = None) -> bool:
         candidate = self.player_pos + component
         support = self._walk_support_height(candidate, component)
         if support is not None:
             candidate.z = support
             ignored_top = support + STEP_HEIGHT + STANDING_TOLERANCE
-            if self._blocking_top_for_player(candidate, ignore_top_at_or_below=ignored_top) is None:
+            if (
+                self._blocking_top_for_player(
+                    candidate,
+                    ignore_top_at_or_below=ignored_top,
+                    ignored_cells=ignored_blockers,
+                )
+                is None
+            ):
                 self.player_pos = candidate
                 self.vertical_velocity = 0.0
                 self.grounded = True
             return True
         return False
 
-    def _player_collides_blocks(self, pos: Vec3) -> bool:
-        return self._blocking_top_for_player(pos) is not None
+    def _can_jump_from_current_position(self) -> bool:
+        if self.grounded or self._has_walk_contact(self.player_pos):
+            return True
+        return bool(self._current_player_overlap_cells())
 
-    def _blocking_top_for_player(self, pos: Vec3, ignore_top_at_or_below: float | None = None) -> float | None:
+    def _has_walk_contact(self, pos: Vec3) -> bool:
+        if self._support_height_below(pos, STANDING_TOLERANCE) is not None:
+            return True
+        probe = Vec3(pos)
+        probe.z -= GROUND_CONTACT_PROBE
+        collision_top = self._blocking_top_for_player(probe)
+        if collision_top is None:
+            return False
+        return collision_top <= pos.z + STEP_HEIGHT + STANDING_TOLERANCE
+
+    def _player_collides_blocks(self, pos: Vec3, ignored_cells: set[Cell] | None = None) -> bool:
+        return self._blocking_top_for_player(pos, ignored_cells=ignored_cells) is not None
+
+    def _blocking_top_for_player(
+        self,
+        pos: Vec3,
+        ignore_top_at_or_below: float | None = None,
+        ignored_cells: set[Cell] | None = None,
+    ) -> float | None:
         min_corner, max_corner = self._player_aabb(pos)
         min_x = math.floor(min_corner.x)
         max_x = math.floor(max_corner.x)
@@ -1321,8 +1382,11 @@ class NekoMouseWorldApp(ShowBase):
         for x in range(min_x, max_x + 1):
             for y in range(min_y, max_y + 1):
                 for z in range(min_z, max_z + 1):
+                    cell = (x, y, z)
+                    if ignored_cells is not None and cell in ignored_cells:
+                        continue
                     height_range = self._shape_height_range_for_world_cell(
-                        (x, y, z),
+                        cell,
                         min_corner.x,
                         max_corner.x,
                         min_corner.y,
@@ -1341,6 +1405,35 @@ class NekoMouseWorldApp(ShowBase):
                             continue
                         return world_top
         return None
+
+    def _current_player_overlap_cells(self) -> set[Cell]:
+        min_corner, max_corner = self._player_aabb(self.player_pos)
+        min_x = math.floor(min_corner.x)
+        max_x = math.floor(max_corner.x)
+        min_y = math.floor(min_corner.y)
+        max_y = math.floor(max_corner.y)
+        min_z = math.floor(min_corner.z)
+        max_z = math.floor(max_corner.z)
+        overlaps: set[Cell] = set()
+
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                for z in range(min_z, max_z + 1):
+                    cell = (x, y, z)
+                    height_range = self._shape_height_range_for_world_cell(
+                        cell,
+                        min_corner.x,
+                        max_corner.x,
+                        min_corner.y,
+                        max_corner.y,
+                    )
+                    if height_range is None:
+                        continue
+                    world_min = z + height_range.minimum
+                    world_top = z + height_range.top
+                    if min_corner.z < world_top and max_corner.z > world_min:
+                        overlaps.add(cell)
+        return overlaps
 
     def _walk_support_height(self, pos: Vec3, component: Vec3) -> float | None:
         horizontal = Vec3(component.x, component.y, 0)
@@ -1389,12 +1482,17 @@ class NekoMouseWorldApp(ShowBase):
         return support
 
     def _foot_support_samples(self, pos: Vec3) -> list[tuple[float, float]]:
+        corner = FOOT_PROBE_FORWARD * 0.72
         return [
             (pos.x, pos.y),
             (pos.x + FOOT_PROBE_FORWARD, pos.y),
             (pos.x - FOOT_PROBE_FORWARD, pos.y),
             (pos.x, pos.y + FOOT_PROBE_FORWARD),
             (pos.x, pos.y - FOOT_PROBE_FORWARD),
+            (pos.x + corner, pos.y + corner),
+            (pos.x + corner, pos.y - corner),
+            (pos.x - corner, pos.y + corner),
+            (pos.x - corner, pos.y - corner),
         ]
 
     def _support_height_at_points(
@@ -1858,7 +1956,7 @@ class NekoMouseWorldApp(ShowBase):
             return
         self.move_mode = "fly" if self.move_mode == "walk" else "walk"
         self.vertical_velocity = 0.0
-        self.grounded = self.move_mode == "walk" and self._support_height_below(self.player_pos, STANDING_TOLERANCE) is not None
+        self.grounded = self.move_mode == "walk" and self._has_walk_contact(self.player_pos)
         self._set_status(f"Movement: {self.move_mode}")
 
     def _toggle_view(self) -> None:
@@ -2243,6 +2341,7 @@ class NekoMouseWorldApp(ShowBase):
                 render.held_model.removeNode()
                 render.held_model = None
             render.held_key = None
+            render.held_clear_started = None
             render.held_anchor.hide()
 
     def _apply_deferred_world_messages(self) -> None:
@@ -2288,6 +2387,7 @@ class NekoMouseWorldApp(ShowBase):
                     render.held_model.removeNode()
                     render.held_model = None
                 render.held_key = None
+                render.held_clear_started = None
 
     def _apply_pending_world_messages(self) -> None:
         deadline = time.perf_counter() + NETWORK_APPLY_FRAME_BUDGET
@@ -2994,7 +3094,7 @@ class NekoMouseWorldApp(ShowBase):
         if self.move_mode != "walk":
             self.move_mode = "walk"
             self.vertical_velocity = 0.0
-            self.grounded = self._support_height_below(self.player_pos, STANDING_TOLERANCE) is not None
+            self.grounded = self._has_walk_contact(self.player_pos)
         self.key_state["up"] = False
         self.key_state["down"] = False
         if status:
@@ -4162,6 +4262,7 @@ class NekoMouseWorldApp(ShowBase):
             self.key_state[key] = False
 
     def _block_intersects_player(self, cell: Cell) -> bool:
+        ignored_cells = self._current_player_overlap_cells()
         digest = self.world_map.get_box(cell)
         temporary = False
         if digest is None:
@@ -4169,7 +4270,7 @@ class NekoMouseWorldApp(ShowBase):
             self.world_map.set_box(cell, digest, self.selected_orientation)
             temporary = True
         try:
-            return self._blocking_top_for_player(self.player_pos) is not None
+            return self._blocking_top_for_player(self.player_pos, ignored_cells=ignored_cells) is not None
         finally:
             if temporary:
                 self.world_map.remove_box(cell)

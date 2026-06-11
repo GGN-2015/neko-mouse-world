@@ -993,12 +993,20 @@ class NetworkWorldClient:
             pitch = float(message.get("pitch", 0.0))
         except (TypeError, ValueError):
             return
-        held_hash = str(message.get("held_hash", ""))
+        previous: RemotePlayer | None = None
+        with self._remote_lock:
+            previous = self.remote_players.get(player_id)
+        held_hash = str(message.get("held_hash", previous.held_hash if previous is not None else ""))
         try:
-            held_orientation = int(message.get("held_orientation", 0))
+            held_orientation = int(
+                message.get("held_orientation", previous.held_orientation if previous is not None else 0)
+            )
         except (TypeError, ValueError):
             held_orientation = 0
-        held_visible = bool(message.get("held_visible")) and bool(held_hash)
+        if "held_visible" in message:
+            held_visible = bool(message.get("held_visible")) and bool(held_hash)
+        else:
+            held_visible = bool(previous is not None and previous.held_visible and held_hash)
         player = RemotePlayer(
             player_id=player_id,
             user_id=str(message.get("user_id", player_id)),
