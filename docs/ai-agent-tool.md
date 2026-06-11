@@ -43,7 +43,9 @@ venv\Scripts\python.exe tools\ai_agent.py --host 127.0.0.1 --port 5678 --model g
   60 seconds.
 - `--request-retries` retries transient Responses request failures; default is
   2 retries.
-- `--max-tool-steps` limits one instruction's tool-call rounds.
+- `--max-tool-steps` limits non-`say` tool calls for one instruction. When
+  omitted or set to `0`, the agent keeps working until the model stops calling
+  tools, the user interrupts it, or an error occurs.
 - `--max-fill-volume` caps bulk region edits.
 - `--screenshot-detail` controls the image detail sent to the model.
 - Type `exit` or `quit` to stop the agent.

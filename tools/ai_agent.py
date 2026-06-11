@@ -86,7 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", default=0.35, type=float, help="response temperature")
     parser.add_argument("--request-timeout", default=60.0, type=float, help="Responses request timeout in seconds")
     parser.add_argument("--request-retries", default=2, type=int, help="Responses retries after transient failures")
-    parser.add_argument("--max-tool-steps", default=24, type=int, help="maximum tool-call rounds per instruction")
+    parser.add_argument(
+        "--max-tool-steps",
+        default=None,
+        type=int,
+        help="maximum non-say tool calls per instruction; omitted or 0 means unlimited",
+    )
     parser.add_argument(
         "--max-fill-volume",
         default=DEFAULT_MAX_FILL_VOLUME,
@@ -848,10 +853,13 @@ def response_tools() -> list[JsonObject]:
 
 
 class AgentCoordinator:
-    def __init__(self, client: ResponsesClient, tools: ClientTools, max_tool_steps: int) -> None:
+    def __init__(self, client: ResponsesClient, tools: ClientTools, max_tool_steps: int | None) -> None:
         self.client = client
         self.tools = tools
-        self.max_tool_steps = max(1, int(max_tool_steps))
+        if max_tool_steps is None or int(max_tool_steps) <= 0:
+            self.max_tool_steps: int | None = None
+        else:
+            self.max_tool_steps = int(max_tool_steps)
         self._tool_schemas = response_tools()
         self._lock = threading.RLock()
         self._generation = 0
@@ -917,8 +925,9 @@ class AgentCoordinator:
                 print(f"[agent] screenshot: {screenshot.get('path')}", flush=True)
 
             last_tool_result: JsonObject | None = None
+            executed_tool_steps = 0
             turn_spoke = False
-            for _step in range(self.max_tool_steps):
+            while True:
                 if not self.is_current(generation):
                     return
                 print(f"[agent] requesting Responses model ({self.client.model})...", flush=True)
@@ -949,6 +958,17 @@ class AgentCoordinator:
                 for call in calls:
                     if not self.is_current(generation):
                         return
+                    counts_as_tool_step = call["name"] != "say"
+                    if (
+                        counts_as_tool_step
+                        and self.max_tool_steps is not None
+                        and executed_tool_steps >= self.max_tool_steps
+                    ):
+                        print(
+                            "AI: I reached the explicit --max-tool-steps limit for this instruction.",
+                            flush=True,
+                        )
+                        return
                     if call["name"] != "say" and not turn_spoke:
                         message = localized_status(
                             instruction,
@@ -972,6 +992,8 @@ class AgentCoordinator:
                     if call["name"] == "say" and result.get("ok"):
                         self._record_assistant_text(generation, str(result.get("said", "")))
                         turn_spoke = True
+                    if counts_as_tool_step:
+                        executed_tool_steps += 1
 
                 if not self.is_current(generation):
                     return
@@ -993,12 +1015,6 @@ class AgentCoordinator:
                 input_items.append(self._user_message(feedback_content))
                 if screenshot.get("ok"):
                     print(f"[agent] visual feedback screenshot: {screenshot.get('path')}", flush=True)
-
-            if self.is_current(generation):
-                if last_tool_result is None:
-                    print("AI: I hit the tool-step limit before taking action.", flush=True)
-                else:
-                    print(f"AI: Tool-step limit reached. Last result: {json_preview(last_tool_result, 900)}", flush=True)
         except Exception as exc:  # noqa: BLE001
             if self.is_current(generation):
                 message = localized_status(
