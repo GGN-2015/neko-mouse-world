@@ -34,6 +34,7 @@ from neko_mouse_world.world_file import Cell, WorldFormatError, validate_cell  #
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 DEFAULT_USER_ID = "ai-agent"
 DEFAULT_MAX_FILL_VOLUME = 4096
+DEFAULT_CLIENT_CALL_TIMEOUT = 30.0
 ZH_NO_RESPONSE = (
     "\u6a21\u578b\u8fd9\u8f6e\u6ca1\u6709\u8fd4\u56de\u6587\u672c\u6216\u5de5\u5177\u8c03\u7528\uff0c"
     "\u6240\u4ee5\u6211\u6ca1\u6709\u6267\u884c\u52a8\u4f5c\u3002"
@@ -68,6 +69,9 @@ You are not only a block placer. You are a conversational builder:
 - Coordinates are integer world cells. Player positions are floating point.
 - If a request is ambiguous, discuss the design choice briefly instead of silently
   guessing. If you are blocked, say exactly what blocked you.
+- If a local client tool returns a retryable main-thread timeout, do not stop.
+  Tell the user the client was busy, then observe/capture again or retry with
+  smaller fill_region chunks or simpler movement.
 
 For any build or movement request:
 - Before the first non-say tool, call say with your design intent.
@@ -111,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_FILL_VOLUME,
         type=int,
         help="maximum boxes changed by one fill_region call",
+    )
+    parser.add_argument(
+        "--client-call-timeout",
+        default=DEFAULT_CLIENT_CALL_TIMEOUT,
+        type=float,
+        help="seconds to wait for one scheduled client main-thread operation",
     )
     parser.add_argument("--screenshot-detail", choices=("low", "high", "auto"), default="high")
     return parser
@@ -291,6 +301,10 @@ class _ScheduledCall:
     fn: Callable[[], Any]
     done: threading.Event | None
     result: dict[str, Any]
+    label: str
+    queued_at: float
+    cancelled: bool = False
+    started: bool = False
 
 
 class MainThreadCallGate:
@@ -298,42 +312,110 @@ class MainThreadCallGate:
         self.app = app
         self._main_thread_id = threading.get_ident()
         self._queue: queue.Queue[_ScheduledCall] = queue.Queue()
+        self._last_drain_at = time.monotonic()
+        self._current_label: str | None = None
+        self._lock = threading.Lock()
         self.app.taskMgr.add(self._drain, "ai-agent-main-thread-call-gate")
 
-    def call(self, fn: Callable[[], Any], timeout: float = 10.0) -> Any:
+    def call(
+        self,
+        fn: Callable[[], Any],
+        timeout: float = DEFAULT_CLIENT_CALL_TIMEOUT,
+        label: str = "client operation",
+        keep_waiting: Callable[[], bool] | None = None,
+    ) -> Any:
         if threading.get_ident() == self._main_thread_id:
             return fn()
         done = threading.Event()
-        scheduled = _ScheduledCall(fn=fn, done=done, result={})
+        scheduled = _ScheduledCall(fn=fn, done=done, result={}, label=label, queued_at=time.monotonic())
         self._queue.put(scheduled)
-        if not done.wait(timeout):
-            raise TimeoutError("timed out waiting for client main thread")
+        soft_deadline = time.monotonic() + max(0.1, timeout)
+        hard_deadline = time.monotonic() + max(timeout * 6.0, timeout + 120.0)
+        warned = False
+        while not done.wait(0.1):
+            if keep_waiting is not None and not keep_waiting():
+                scheduled.cancelled = True
+                raise RuntimeError(f"client main-thread operation interrupted before completion: {label}")
+            now = time.monotonic()
+            if now < soft_deadline:
+                continue
+            state = self._state_snapshot()
+            if not warned:
+                print(
+                    "[agent] still waiting for client main thread "
+                    f"during {label}; queue_depth={state['queue_depth']}; "
+                    f"current_main_thread_op={state['current_label'] or 'none'}",
+                    flush=True,
+                )
+                warned = True
+            main_loop_alive = float(state["last_drain_age"]) < timeout
+            operation_running = state["current_label"] is not None
+            if now >= hard_deadline or (not main_loop_alive and not operation_running):
+                if not scheduled.started:
+                    scheduled.cancelled = True
+                raise TimeoutError(self._timeout_message(scheduled, timeout))
         if "exception" in scheduled.result:
             raise scheduled.result["exception"]
         return scheduled.result.get("value")
 
-    def call_async(self, fn: Callable[[], Any]) -> None:
+    def call_async(self, fn: Callable[[], Any], label: str = "client async operation") -> None:
         if threading.get_ident() == self._main_thread_id:
             fn()
             return
-        self._queue.put(_ScheduledCall(fn=fn, done=None, result={}))
+        self._queue.put(_ScheduledCall(fn=fn, done=None, result={}, label=label, queued_at=time.monotonic()))
 
     def _drain(self, task: Any) -> Any:
+        with self._lock:
+            self._last_drain_at = time.monotonic()
         for _ in range(128):
             try:
                 scheduled = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if scheduled.cancelled:
+                if scheduled.done is not None:
+                    scheduled.result["exception"] = TimeoutError(
+                        f"cancelled stale client main-thread operation: {scheduled.label}"
+                    )
+                    scheduled.done.set()
+                continue
             try:
+                with self._lock:
+                    scheduled.started = True
+                    self._current_label = scheduled.label
                 scheduled.result["value"] = scheduled.fn()
             except BaseException as exc:  # noqa: BLE001
                 scheduled.result["exception"] = exc
                 if scheduled.done is None:
                     traceback.print_exception(type(exc), exc, exc.__traceback__)
             finally:
+                with self._lock:
+                    self._current_label = None
                 if scheduled.done is not None:
                     scheduled.done.set()
         return task.cont
+
+    def _timeout_message(self, scheduled: _ScheduledCall, timeout: float) -> str:
+        state = self._state_snapshot()
+        return (
+            "timed out waiting for client main thread "
+            f"after {timeout:.1f}s during {scheduled.label}; "
+            f"queued_for={time.monotonic() - scheduled.queued_at:.1f}s; "
+            f"started={scheduled.started}; "
+            f"queue_depth={state['queue_depth']}; "
+            f"last_main_loop_drain={state['last_drain_age']:.1f}s ago; "
+            f"current_main_thread_op={state['current_label'] or 'none'}"
+        )
+
+    def _state_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            last_drain_age = time.monotonic() - self._last_drain_at
+            current_label = self._current_label
+        return {
+            "last_drain_age": last_drain_age,
+            "current_label": current_label,
+            "queue_depth": self._queue.qsize(),
+        }
 
 
 class ClientTools:
@@ -343,14 +425,16 @@ class ClientTools:
         gate: MainThreadCallGate,
         max_fill_volume: int,
         screenshot_detail: str,
+        client_call_timeout: float,
     ) -> None:
         self.app = app
         self.gate = gate
         self.max_fill_volume = max(1, int(max_fill_volume))
         self.screenshot_detail = screenshot_detail
+        self.client_call_timeout = max(1.0, float(client_call_timeout))
 
     def stop_motion_async(self) -> None:
-        self.gate.call_async(lambda: self.app.stop_automation_movement())
+        self.gate.call_async(lambda: self.app.stop_automation_movement(), label="stop_motion")
 
     def execute(
         self,
@@ -387,14 +471,23 @@ class ClientTools:
                 return {"ok": False, "error": f"unknown tool {name!r}"}
             return tool(arguments, generation, is_current)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            result: JsonObject = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if isinstance(exc, TimeoutError) and "client main thread" in str(exc):
+                result["retryable"] = True
+                result["recovery_hint"] = (
+                    "The visible local client was busy or not advancing its main loop fast enough. "
+                    "Continue by retrying the same action in smaller steps, observing again, or asking "
+                    "for a fresh screenshot."
+                )
+            return result
 
     def _call_current(
         self,
         generation: int,
         is_current: Callable[[int], bool],
         op: Callable[[], JsonObject],
-        timeout: float = 10.0,
+        timeout: float | None = None,
+        label: str = "client operation",
     ) -> JsonObject:
         if not is_current(generation):
             return {"ok": False, "interrupted": True}
@@ -404,7 +497,12 @@ class ClientTools:
                 return {"ok": False, "interrupted": True}
             return op()
 
-        return self.gate.call(guarded, timeout=timeout)
+        return self.gate.call(
+            guarded,
+            timeout=timeout or self.client_call_timeout,
+            label=label,
+            keep_waiting=lambda: is_current(generation),
+        )
 
     def _flush_network_edits(self, timeout: float = 5.0) -> JsonObject:
         synced = self.app.wait_for_network_sends(timeout=timeout)
@@ -470,7 +568,7 @@ class ClientTools:
                 "status": self.app.last_status_text,
             }
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="observe")
 
     def upload_box_asset(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         digest = str(arguments.get("hash", "")).strip()
@@ -485,7 +583,7 @@ class ClientTools:
                 "status": self.app.last_status_text,
             }
 
-        result = self._call_current(generation, is_current, op)
+        result = self._call_current(generation, is_current, op, label="upload_box_asset")
         network_state = self._flush_network_edits(timeout=5.0) if result.get("ok") else self._network_state()
         return {**result, **network_state, "ok": bool(result.get("ok")) and bool(network_state["network_synced"])}
 
@@ -505,7 +603,7 @@ class ClientTools:
                 result["_image_detail"] = self.screenshot_detail
             return result
 
-        return self._call_current(generation, is_current, op, timeout=10.0)
+        return self._call_current(generation, is_current, op, timeout=max(10.0, self.client_call_timeout), label="capture_view")
 
     def create_box_asset(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         n = int(arguments.get("n", 0))
@@ -546,7 +644,7 @@ class ClientTools:
                 "orientation": orientation,
             }
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="create_box_asset")
 
     def select_box(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         digest = str(arguments.get("hash", "")).strip()
@@ -556,7 +654,7 @@ class ClientTools:
             selected_hash, selected_orientation = self.app.set_selected_box(digest=digest, orientation=orientation)
             return {"ok": True, "hash": selected_hash, "orientation": selected_orientation}
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="select_box")
 
     def place_box(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         cell = self._world_cell(arguments.get("cell"))
@@ -576,7 +674,7 @@ class ClientTools:
                 "status": self.app.last_status_text,
             }
 
-        result = self._call_current(generation, is_current, op)
+        result = self._call_current(generation, is_current, op, label="place_box")
         network_state = self._flush_network_edits(timeout=5.0) if result.get("ok") else self._network_state()
         return {**result, **network_state, "ok": bool(result.get("ok")) and bool(network_state["network_synced"])}
 
@@ -591,7 +689,7 @@ class ClientTools:
                 "status": self.app.last_status_text,
             }
 
-        result = self._call_current(generation, is_current, op)
+        result = self._call_current(generation, is_current, op, label="delete_box")
         network_state = self._flush_network_edits(timeout=5.0) if result.get("ok") else self._network_state()
         return {**result, **network_state, "ok": bool(result.get("ok")) and bool(network_state["network_synced"])}
 
@@ -620,30 +718,29 @@ class ClientTools:
 
         changed = 0
         last_status = ""
-        batch_size = 64
+        batch_size = 256
         for start in range(0, len(cells), batch_size):
             if not is_current(generation):
                 return {"ok": False, "interrupted": True, "mode": mode, "changed": changed}
             batch = cells[start : start + batch_size]
 
             def batch_op(batch_cells: list[Cell] = batch) -> JsonObject:
-                batch_changed = 0
                 if mode == "place":
-                    for cell in batch_cells:
-                        if self.app.set_world_box_at(cell, digest=digest, orientation=orientation, include_asset=False):
-                            batch_changed += 1
-                else:
-                    for cell in batch_cells:
-                        if self.app.delete_world_box_at(cell):
-                            batch_changed += 1
-                return {"ok": True, "changed": batch_changed, "status": self.app.last_status_text}
+                    return self._fill_place_batch(batch_cells, digest, orientation)
+                return self._fill_delete_batch(batch_cells)
 
-            batch_result = self._call_current(generation, is_current, batch_op, timeout=max(5.0, len(batch) * 0.05))
+            batch_timeout = max(self.client_call_timeout, min(120.0, 5.0 + len(batch) * 0.05))
+            batch_result = self._call_current(
+                generation,
+                is_current,
+                batch_op,
+                timeout=batch_timeout,
+                label=f"fill_region_{mode}_batch_{start // batch_size + 1}",
+            )
             if not batch_result.get("ok"):
                 return batch_result
             changed += int(batch_result.get("changed", 0))
             last_status = str(batch_result.get("status", last_status))
-            self._flush_network_edits(timeout=5.0)
 
         network_state = self._flush_network_edits(timeout=max(5.0, min(30.0, volume * 0.02)))
         return {
@@ -656,6 +753,46 @@ class ClientTools:
             "status": last_status,
             **network_state,
         }
+
+    def _fill_place_batch(self, cells: list[Cell], digest: str, orientation: int) -> JsonObject:
+        if not self.app._permission_allowed("allow_set", "set boxes"):
+            return {"ok": False, "error": self.app.last_status_text, **self._network_state()}
+        if not self.app._can_edit_world():
+            return {"ok": False, "error": self.app.last_status_text, **self._network_state()}
+        changed = 0
+        for cell in cells:
+            existing = cell in self.app.world_map.boxes
+            if self.app.world_map.get_box(cell) == digest and self.app.world_map.get_orientation(cell) == orientation:
+                continue
+            self.app._apply_world_box(cell, digest, orientation, rebuild_now=False)
+            changed += 1
+            if self.app.network_client is not None:
+                if existing:
+                    self.app.network_client.send_set_box(cell, digest, orientation, include_asset=False)
+                else:
+                    self.app.network_client.send_place(cell, digest, orientation, include_asset=False)
+        if changed:
+            self.app._set_status(f"Filled {changed} boxes with {digest[:12]} orientation={orientation}")
+        return {"ok": True, "changed": changed, "status": self.app.last_status_text}
+
+    def _fill_delete_batch(self, cells: list[Cell]) -> JsonObject:
+        if not self.app._permission_allowed("allow_break", "break boxes"):
+            return {"ok": False, "error": self.app.last_status_text, **self._network_state()}
+        if not self.app._can_edit_world():
+            return {"ok": False, "error": self.app.last_status_text, **self._network_state()}
+        changed = 0
+        for cell in cells:
+            digest = self.app.world_map.get_box(cell)
+            if digest is None:
+                continue
+            self.app.last_deleted_box = (cell, digest, self.app.world_map.get_orientation(cell))
+            self.app._apply_remove_world_box(cell, play_sound=False, rebuild_now=False)
+            changed += 1
+            if self.app.network_client is not None:
+                self.app.network_client.send_delete(cell)
+        if changed:
+            self.app._set_status(f"Deleted {changed} boxes")
+        return {"ok": True, "changed": changed, "status": self.app.last_status_text}
 
     def _prepare_fill_asset(
         self,
@@ -672,7 +809,7 @@ class ClientTools:
                 return {"ok": False, "error": self.app.last_status_text, **self._network_state()}
             return {"ok": True, "hash": actual_digest, "status": self.app.last_status_text}
 
-        result = self._call_current(generation, is_current, op)
+        result = self._call_current(generation, is_current, op, label="prepare_fill_asset")
         if result.get("ok"):
             network_state = self._flush_network_edits(timeout=5.0)
             result = {**result, **network_state, "ok": bool(network_state["network_synced"])}
@@ -692,7 +829,7 @@ class ClientTools:
             self.app._set_status(f"Movement: {self.app.move_mode}")
             return {"ok": True, "move_mode": self.app.move_mode, "pose": self.app.get_player_pose()}
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="set_move_mode")
 
     def set_look(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         heading = arguments.get("heading")
@@ -706,7 +843,7 @@ class ClientTools:
             self.app.set_automation_look(target_heading + heading_delta, target_pitch + pitch_delta)
             return {"ok": True, "pose": self.app.get_player_pose()}
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="set_look")
 
     def look_at_cell(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         cell = self._world_cell(arguments.get("cell"))
@@ -721,7 +858,7 @@ class ClientTools:
             self.app.set_automation_look(heading, pitch)
             return {"ok": True, "cell": cell, "pose": self.app.get_player_pose()}
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="look_at_cell")
 
     def set_movement(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         forward = float(arguments.get("forward", 0.0))
@@ -740,7 +877,7 @@ class ClientTools:
                 "pose": self.app.get_player_pose(),
             }
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="set_movement")
 
     def move_for(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         seconds = max(0.0, min(30.0, float(arguments.get("seconds", 1.0))))
@@ -773,7 +910,7 @@ class ClientTools:
                 self.app.move_mode = "fly"
             return {"ok": True, "pose": self.app.get_player_pose()}
 
-        self._call_current(generation, is_current, setup)
+        self._call_current(generation, is_current, setup, label="move_to_setup")
         deadline = time.monotonic() + timeout
         interrupted = False
         arrived = False
@@ -796,7 +933,7 @@ class ClientTools:
                 self.app.set_automation_movement(forward=forward, right=0.0, vertical=vertical_axis)
                 return {"ok": True, "distance": distance, "horizontal": horizontal, "pose": self.app.get_player_pose()}
 
-            state = self._call_current(generation, is_current, step)
+            state = self._call_current(generation, is_current, step, label="move_to_step")
             if float(state.get("distance", 9999.0)) <= tolerance:
                 arrived = True
                 break
@@ -829,7 +966,7 @@ class ClientTools:
             tz = max(0.0, center[2])
             return {"ok": True, "target": [tx, ty, tz], "center_cell": [round(center[0] - 0.5), round(center[1] - 0.5), round(center[2] - 0.5)]}
 
-        target_result = self._call_current(generation, is_current, choose_target)
+        target_result = self._call_current(generation, is_current, choose_target, label="move_near_region_choose_target")
         if not target_result.get("ok"):
             return target_result
         move_result = self.move_to(
@@ -852,14 +989,14 @@ class ClientTools:
             self.app.stop_automation_movement()
             return {"ok": True, "movement": {"forward": 0.0, "right": 0.0, "vertical": 0.0}, "pose": self.app.get_player_pose()}
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="stop_movement")
 
     def jump(self, _arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         def op() -> JsonObject:
             self.app.automation_jump()
             return {"ok": True, "pose": self.app.get_player_pose()}
 
-        return self._call_current(generation, is_current, op)
+        return self._call_current(generation, is_current, op, label="jump")
 
     def _world_cell(self, value: Any) -> Cell:
         if not isinstance(value, (list, tuple)) or len(value) != 3:
@@ -1350,6 +1487,7 @@ def main(argv: list[str] | None = None) -> int:
         gate,
         max_fill_volume=args.max_fill_volume,
         screenshot_detail=args.screenshot_detail,
+        client_call_timeout=args.client_call_timeout,
     )
     client = ResponsesClient(
         endpoint=endpoint,

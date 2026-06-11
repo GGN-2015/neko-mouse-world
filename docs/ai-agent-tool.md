@@ -37,6 +37,13 @@ If the upstream model reports that the input exceeds its context window, the
 agent compacts its Responses input automatically: it keeps the original user
 instruction, keeps the most recent half of the retained messages, drops old
 screenshots except the newest one, and retries.
+If a tool has to run code on the visible client main thread, the agent waits
+with diagnostics instead of immediately abandoning the turn. A timeout such as
+`timed out waiting for client main thread` means the local Panda3D client did
+not finish a scheduled screenshot, movement, observation, or world-edit
+operation quickly enough. The error now includes the operation label, queue
+depth, and main-loop heartbeat age; stale queued calls are cancelled so a tool
+does not report failure and then mutate the world later.
 
 Useful options:
 
@@ -55,5 +62,9 @@ venv\Scripts\python.exe tools\ai_agent.py --host 127.0.0.1 --port 5678 --model g
   omitted or set to `0`, the agent keeps working until the model stops calling
   tools, the user interrupts it, or an error occurs.
 - `--max-fill-volume` caps bulk region edits.
+- `--client-call-timeout` controls the soft wait for one local client
+  main-thread operation; default is 30 seconds. If the main thread is still
+  actively executing the operation, the agent keeps waiting with diagnostics
+  until it finishes, the user interrupts it, or the hard safety limit is hit.
 - `--screenshot-detail` controls the image detail sent to the model.
 - Type `exit` or `quit` to stop the agent.
