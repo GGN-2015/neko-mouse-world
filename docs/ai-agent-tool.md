@@ -44,8 +44,9 @@ venv\Scripts\python.exe tools\ai_agent.py --host 127.0.0.1 --port 5678 --model g
 - `--user-id` selects the requested multiplayer user ID.
 - `--request-timeout` controls how long one model request may wait; default is
   60 seconds.
-- `--request-retries` retries transient Responses request failures; default is
-  2 retries.
+- `--request-retries` retries transient Responses request failures. When
+  omitted or set to a negative value, request retries are unlimited and can be
+  interrupted by a new user instruction.
 - `--max-tool-steps` limits non-`say` tool calls for one instruction. When
   omitted or set to `0`, the agent keeps working until the model stops calling
   tools, the user interrupts it, or an error occurs.

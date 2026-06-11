@@ -88,7 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Responses-capable multimodal model")
     parser.add_argument("--temperature", default=0.35, type=float, help="response temperature")
     parser.add_argument("--request-timeout", default=60.0, type=float, help="Responses request timeout in seconds")
-    parser.add_argument("--request-retries", default=2, type=int, help="Responses retries after transient failures")
+    parser.add_argument(
+        "--request-retries",
+        default=None,
+        type=int,
+        help="Responses retries after transient failures; omitted or negative means unlimited",
+    )
     parser.add_argument(
         "--max-tool-steps",
         default=None,
@@ -153,16 +158,24 @@ class ResponsesClient:
         model: str,
         temperature: float,
         timeout: float,
-        retries: int,
+        retries: int | None,
     ) -> None:
         self.url = responses_url(endpoint)
         self.api_key = api_key
         self.model = model
         self.temperature = float(temperature)
         self.timeout = float(timeout)
-        self.retries = max(0, int(retries))
+        if retries is None or int(retries) < 0:
+            self.retries: int | None = None
+        else:
+            self.retries = int(retries)
 
-    def create(self, input_items: list[JsonObject], tools: list[JsonObject]) -> JsonObject:
+    def create(
+        self,
+        input_items: list[JsonObject],
+        tools: list[JsonObject],
+        keep_running: Callable[[], bool] | None = None,
+    ) -> JsonObject:
         payload: JsonObject = {
             "model": self.model,
             "instructions": SYSTEM_PROMPT,
@@ -177,7 +190,7 @@ class ResponsesClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        body = self._post_with_retries(data, headers)
+        body = self._post_with_retries(data, headers, keep_running)
 
         try:
             parsed = json.loads(body)
@@ -187,11 +200,17 @@ class ResponsesClient:
             raise RuntimeError("Responses body was not a JSON object")
         return parsed
 
-    def _post_with_retries(self, data: bytes, headers: JsonObject) -> str:
+    def _post_with_retries(
+        self,
+        data: bytes,
+        headers: JsonObject,
+        keep_running: Callable[[], bool] | None = None,
+    ) -> str:
         last_error: BaseException | None = None
-        for attempt in range(self.retries + 1):
+        attempt = 0
+        while keep_running is None or keep_running():
             request = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
-            attempt_label = f"{attempt + 1}/{self.retries + 1}"
+            attempt_label = str(attempt + 1) if self.retries is None else f"{attempt + 1}/{self.retries + 1}"
             try:
                 print(f"[agent] POST {self.url} attempt {attempt_label}", flush=True)
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -201,39 +220,58 @@ class ResponsesClient:
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 if self._should_retry_http(exc.code, attempt):
-                    self._retry_sleep(attempt, f"HTTP {exc.code}")
                     last_error = RuntimeError(f"HTTP {exc.code}: {detail[:1600]}")
+                    self._retry_sleep(attempt, f"HTTP {exc.code}", keep_running)
+                    attempt += 1
                     continue
                 raise RuntimeError(f"Responses request failed with HTTP {exc.code}: {detail[:1600]}") from exc
             except urllib.error.URLError as exc:
                 last_error = exc
                 reason = getattr(exc, "reason", None)
-                if self._is_timeout(reason) or attempt < self.retries:
-                    self._retry_sleep(attempt, str(reason or exc))
+                if self._can_retry(attempt) and self._is_retryable_url_error(reason):
+                    self._retry_sleep(attempt, str(reason or exc), keep_running)
+                    attempt += 1
                     continue
                 raise RuntimeError(f"Responses request failed: {exc}") from exc
             except (TimeoutError, socket.timeout) as exc:
                 last_error = exc
-                if attempt < self.retries:
-                    self._retry_sleep(attempt, "read timeout")
+                if self._can_retry(attempt):
+                    self._retry_sleep(attempt, "read timeout", keep_running)
+                    attempt += 1
                     continue
+                attempts_text = "unlimited" if self.retries is None else str(self.retries + 1)
                 raise RuntimeError(
-                    f"Responses request timed out after {self.timeout:.1f}s and {self.retries + 1} attempts"
+                    f"Responses request timed out after {self.timeout:.1f}s and {attempts_text} attempts"
                 ) from exc
+            attempt += 1
+        raise RuntimeError("Responses request was interrupted by a newer user instruction")
+
         raise RuntimeError(f"Responses request failed after retries: {last_error}")
 
     def _should_retry_http(self, status_code: int, attempt: int) -> bool:
-        if attempt >= self.retries:
+        if not self._can_retry(attempt):
             return False
         return status_code in {408, 409, 425, 429} or 500 <= status_code <= 599
 
-    def _retry_sleep(self, attempt: int, reason: str) -> None:
-        delay = min(8.0, 1.5 * (2**attempt))
+    def _can_retry(self, attempt: int) -> bool:
+        return self.retries is None or attempt < self.retries
+
+    def _retry_sleep(self, attempt: int, reason: str, keep_running: Callable[[], bool] | None = None) -> None:
+        delay = min(30.0, 1.5 * (2**min(attempt, 8)))
         print(f"[agent] Responses request failed ({reason}); retrying in {delay:.1f}s.", flush=True)
-        time.sleep(delay)
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if keep_running is not None and not keep_running():
+                return
+            time.sleep(min(0.25, deadline - time.monotonic()))
 
     def _is_timeout(self, value: object) -> bool:
         return isinstance(value, (TimeoutError, socket.timeout)) or "timed out" in str(value).lower()
+
+    def _is_retryable_url_error(self, value: object) -> bool:
+        if self._is_timeout(value):
+            return True
+        return isinstance(value, (ConnectionError, OSError))
 
 
 @dataclass
@@ -982,7 +1020,11 @@ class AgentCoordinator:
                 if not self.is_current(generation):
                     return
                 print(f"[agent] requesting Responses model ({self.client.model})...", flush=True)
-                response = self.client.create(input_items, self._tool_schemas)
+                response = self.client.create(
+                    input_items,
+                    self._tool_schemas,
+                    keep_running=lambda generation=generation: self.is_current(generation),
+                )
                 output = response.get("output", [])
                 if not isinstance(output, list):
                     raise RuntimeError(f"Responses output was not a list: {json_preview(response)}")
