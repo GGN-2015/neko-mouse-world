@@ -59,7 +59,7 @@ from .client_net import DEFAULT_PERMISSIONS as CLIENT_DEFAULT_PERMISSIONS, Netwo
 from .collision import CollisionShapeCache
 from .net_protocol import SERVER_LOG_PERMISSION_DENIED_LINE, list_to_cell
 from .orientation import IDENTITY_ORIENTATION, nearest_axis, rotate_normal, rotate_point, turn_orientation_around_axis
-from .world_file import Cell, LoadedWorld, WorldFormatError, WorldMap, save_world
+from .world_file import Cell, LoadedWorld, WorldFormatError, WorldMap, save_world, validate_cell
 
 
 loadPrcFileData(
@@ -266,6 +266,7 @@ class NekoMouseWorldApp(ShowBase):
         self.move_mode = "walk"
         self.vertical_velocity = 0.0
         self.grounded = True
+        self.human_input_enabled = True
         self.mouse_captured = False
         self.ui_open = False
         self.modal_mode: str | None = None
@@ -338,6 +339,10 @@ class NekoMouseWorldApp(ShowBase):
             "up": False,
             "down": False,
         }
+        self.automation_forward = 0.0
+        self.automation_right = 0.0
+        self.automation_vertical = 0.0
+        self.automation_jump_requested = False
 
         self._setup_lights()
         self._setup_player_model()
@@ -658,9 +663,10 @@ class NekoMouseWorldApp(ShowBase):
         self.accept("escape", self._release_mouse_capture)
         self.accept("window-event", self._handle_window_event)
         self.accept("f", self._toggle_move_mode)
-        self.accept("f2", self.save_current)
-        self.accept("control-s", self.save_current)
+        self.accept("f2", self._save_current_key)
+        self.accept("control-s", self._save_current_key)
         self.accept("f5", self._toggle_view)
+        self.accept("f12", self._capture_screenshot_key)
         self.accept("e", self._edit_target_box)
         self.accept("h", self._open_help)
         self.accept("c", self._look_at_world_focus)
@@ -723,6 +729,9 @@ class NekoMouseWorldApp(ShowBase):
             self.accept(CLOSE_REQUEST_EVENT, self._request_quit)
 
     def _set_key(self, name: str, value: bool) -> None:
+        if not self.human_input_enabled:
+            self.key_state[name] = False
+            return
         if self.modal_mode == "focus_pause":
             self.key_state[name] = False
             return
@@ -738,6 +747,8 @@ class NekoMouseWorldApp(ShowBase):
             self._mark_player_input_active()
 
     def _space_pressed(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.world_load_job is not None:
@@ -759,8 +770,9 @@ class NekoMouseWorldApp(ShowBase):
         loading = self.world_load_job is not None
         focus_paused = self.modal_mode == "focus_pause"
         controls_enabled = self._player_controls_enabled(loading)
+        human_controls_enabled = controls_enabled and self.human_input_enabled
         self._sync_network_permissions_snapshot()
-        if self.mouse_captured and controls_enabled:
+        if self.mouse_captured and human_controls_enabled:
             self._update_mouse_look()
         if not loading:
             self._update_player(dt, allow_input=controls_enabled)
@@ -1201,6 +1213,295 @@ class NekoMouseWorldApp(ShowBase):
     def _mark_player_input_active(self) -> None:
         self.last_player_input_time = globalClock.getFrameTime()
 
+    def set_human_input_enabled(self, enabled: bool) -> None:
+        """Enable or disable direct keyboard/mouse gameplay controls.
+
+        Automation APIs keep working while human input is disabled. This is used
+        by external agents that show the client window but own all player input.
+        """
+        self.human_input_enabled = bool(enabled)
+        if not self.human_input_enabled:
+            self._clear_movement_keys()
+            self.set_mouse_capture(False)
+
+    def get_human_input_enabled(self) -> bool:
+        """Return whether direct keyboard/mouse gameplay controls are enabled."""
+        return self.human_input_enabled
+
+    def get_player_position(self) -> tuple[float, float, float]:
+        """Return the local player's current world-space foot position."""
+        return (float(self.player_pos.x), float(self.player_pos.y), float(self.player_pos.z))
+
+    def get_player_coordinates(self) -> tuple[float, float, float]:
+        """Alias for get_player_position(), kept for scripts that prefer coordinate wording."""
+        return self.get_player_position()
+
+    def get_player_pose(self) -> dict[str, object]:
+        """Return position, velocity, heading, pitch, movement mode, and grounded state."""
+        return {
+            "position": self.get_player_position(),
+            "velocity": (float(self.player_velocity.x), float(self.player_velocity.y), float(self.player_velocity.z)),
+            "heading": float(self.heading),
+            "pitch": float(self.pitch),
+            "move_mode": self.move_mode,
+            "grounded": bool(self.grounded),
+        }
+
+    def get_box_hash_at(self, x: int | float | Cell, y: int | float | None = None, z: int | float | None = None) -> str | None:
+        """Return the .box hash at a world-grid cell, or None when the cell is empty."""
+        return self.world_map.get_box(self._api_cell(x, y, z))
+
+    def get_box_orientation_at(
+        self,
+        x: int | float | Cell,
+        y: int | float | None = None,
+        z: int | float | None = None,
+    ) -> int | None:
+        """Return the orientation at a world-grid cell, or None when the cell is empty."""
+        cell = self._api_cell(x, y, z)
+        if cell not in self.world_map.boxes:
+            return None
+        return self.world_map.get_orientation(cell)
+
+    def get_box_at(
+        self,
+        x: int | float | Cell,
+        y: int | float | None = None,
+        z: int | float | None = None,
+    ) -> tuple[str, int] | None:
+        """Return (hash, orientation) for a world-grid cell, or None when empty."""
+        cell = self._api_cell(x, y, z)
+        digest = self.world_map.get_box(cell)
+        if digest is None:
+            return None
+        return digest, self.world_map.get_orientation(cell)
+
+    def get_selected_box(self) -> tuple[str, int]:
+        """Return the box hash and orientation that future placements will use."""
+        return str(self.selected_hash), int(self.selected_orientation)
+
+    def set_selected_box(self, digest: str | None = None, orientation: int | None = None) -> tuple[str, int]:
+        """Set the selected placement box and return the resulting selection."""
+        if digest is not None:
+            digest_text = str(digest)
+            self.surface_cache.get(digest_text)
+            self.selected_hash = digest_text
+        if orientation is not None:
+            self.selected_orientation = int(orientation) % 24
+        self._refresh_held_item(force=True)
+        return self.get_selected_box()
+
+    def set_world_box_at(
+        self,
+        x: int | float | Cell,
+        y: int | float | None = None,
+        z: int | float | None = None,
+        digest: str | None = None,
+        orientation: int | None = None,
+    ) -> bool:
+        """Place or replace a world box at a grid cell.
+
+        The selected box is used when *digest* is omitted. Networked clients send
+        the single-cell change to the server in the normal background TCP path.
+        """
+        cell = self._api_cell(x, y, z)
+        target_digest = str(self.selected_hash if digest is None else digest)
+        target_orientation = int(self.selected_orientation if orientation is None else orientation) % 24
+        if not target_digest:
+            self._set_status("No selected box")
+            return False
+        if not self._permission_allowed("allow_set", "set boxes"):
+            return False
+        if not self._can_edit_world():
+            return False
+        try:
+            self.surface_cache.get(target_digest)
+            self.collision_cache.get(target_digest, target_orientation)
+        except (BoxFormatError, WorldFormatError) as exc:
+            self._set_status(f"Cannot set box: {exc}")
+            return False
+        self._set_world_box_with_orientation(cell, target_digest, target_orientation)
+        self._set_status(f"Set {cell} -> {target_digest[:12]} orientation={target_orientation}")
+        return True
+
+    def delete_world_box_at(
+        self,
+        x: int | float | Cell,
+        y: int | float | None = None,
+        z: int | float | None = None,
+    ) -> bool:
+        """Delete the world box at a grid cell and return whether one was removed."""
+        cell = self._api_cell(x, y, z)
+        if cell not in self.world_map.boxes:
+            self._set_status(f"No box at {cell}")
+            return False
+        if not self._permission_allowed("allow_break", "break boxes"):
+            return False
+        if not self._can_edit_world():
+            return False
+        digest = self.world_map.get_box(cell)
+        if digest is not None:
+            self.last_deleted_box = (cell, digest, self.world_map.get_orientation(cell))
+        self._remove_world_box(cell)
+        return True
+
+    def rotate_world_box_at(
+        self,
+        x: int | float | Cell,
+        y: int | float | None = None,
+        z: int | float | None = None,
+        orientation: int = IDENTITY_ORIENTATION,
+    ) -> bool:
+        """Set the orientation of an existing world box."""
+        cell = self._api_cell(x, y, z)
+        if cell not in self.world_map.boxes:
+            self._set_status(f"No box at {cell}")
+            return False
+        if not self._permission_allowed("allow_set", "rotate boxes"):
+            return False
+        if not self._can_edit_world():
+            return False
+        new_orientation = int(orientation) % 24
+        self.world_map.set_orientation(cell, new_orientation)
+        self._rebuild_chunks_for_cell(cell)
+        if self.network_client is not None:
+            self.network_client.send_rotate(cell, new_orientation)
+        self._set_status(f"Rotated {cell} orientation={new_orientation}")
+        return True
+
+    def get_world_boxes_near_player(self, radius: int = 8, limit: int = 200) -> list[dict[str, object]]:
+        """Return nearby world boxes for automation clients."""
+        safe_radius = max(0, int(radius))
+        safe_limit = max(0, int(limit))
+        center = (math.floor(self.player_pos.x), math.floor(self.player_pos.y), math.floor(self.player_pos.z))
+        rows: list[tuple[float, Cell, str, int]] = []
+        radius_squared = float(safe_radius * safe_radius)
+        for cell, digest in self.world_map.boxes.items():
+            dx = cell[0] + 0.5 - self.player_pos.x
+            dy = cell[1] + 0.5 - self.player_pos.y
+            dz = cell[2] + 0.5 - self.player_pos.z
+            distance_squared = dx * dx + dy * dy + dz * dz
+            if distance_squared <= radius_squared:
+                rows.append((distance_squared, cell, digest, self.world_map.get_orientation(cell)))
+        rows.sort(key=lambda row: (row[0], row[1]))
+        return [
+            {"cell": cell, "hash": digest, "orientation": orientation}
+            for _distance, cell, digest, orientation in rows[:safe_limit]
+            if abs(cell[0] - center[0]) <= safe_radius
+        ]
+
+    def capture_screenshot(self, path: str | Path | None = None) -> Path | None:
+        """Capture the current client window and return the written image path.
+
+        When *path* is omitted, screenshots are saved under the opened world's
+        ``screenshots`` directory. When *path* has no suffix, ``.png`` is added.
+        ``None`` is returned if the window cannot save the image.
+        """
+        target = self._resolve_screenshot_path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._set_status("Screenshot failed")
+            return None
+        try:
+            saved = self.win.saveScreenshot(Filename.fromOsSpecific(str(target)), "") if self.win is not None else False
+        except Exception:
+            saved = False
+        if not saved:
+            self._set_status("Screenshot failed")
+            return None
+        self._set_status(f"Screenshot saved: {target.name}")
+        return target
+
+    def take_screenshot(self, path: str | Path | None = None) -> Path | None:
+        """Alias for capture_screenshot(), provided for automation scripts."""
+        return self.capture_screenshot(path)
+
+    def save_screenshot(self, path: str | Path | None = None) -> Path | None:
+        """Alias for capture_screenshot(), provided for automation scripts."""
+        return self.capture_screenshot(path)
+
+    def _capture_screenshot_key(self) -> None:
+        if not self.human_input_enabled:
+            return
+        self.capture_screenshot()
+
+    def set_automation_movement(self, forward: float = 0.0, right: float = 0.0, vertical: float = 0.0) -> None:
+        """Drive player movement from scripts without replacing keyboard input.
+
+        forward/right/vertical are clamped to -1..1. Vertical affects fly mode
+        only; use automation_jump() for walk-mode jumping.
+        """
+        self.automation_forward = self._api_axis(forward)
+        self.automation_right = self._api_axis(right)
+        self.automation_vertical = self._api_axis(vertical)
+        if self._automation_input_active():
+            self._mark_player_input_active()
+
+    def stop_automation_movement(self) -> None:
+        """Clear scripted movement inputs while leaving normal keyboard input untouched."""
+        self.automation_forward = 0.0
+        self.automation_right = 0.0
+        self.automation_vertical = 0.0
+        self.automation_jump_requested = False
+
+    def automation_jump(self) -> None:
+        """Request one walk-mode jump on the next client update."""
+        self.automation_jump_requested = True
+        self._mark_player_input_active()
+
+    def set_automation_look(self, heading: float | None = None, pitch: float | None = None) -> None:
+        """Set local camera heading and/or pitch in degrees."""
+        if heading is not None:
+            self.heading = float(heading)
+        if pitch is not None:
+            self.pitch = max(-89.0, min(89.0, float(pitch)))
+        self._mark_player_input_active()
+
+    def turn_automation_look(self, heading_delta: float = 0.0, pitch_delta: float = 0.0) -> None:
+        """Add heading/pitch deltas in degrees to the local camera."""
+        self.set_automation_look(self.heading + float(heading_delta), self.pitch + float(pitch_delta))
+
+    def _api_cell(
+        self,
+        x: int | float | Cell,
+        y: int | float | None = None,
+        z: int | float | None = None,
+    ) -> Cell:
+        if y is None and z is None:
+            if not isinstance(x, (list, tuple)):
+                raise WorldFormatError("cell lookup requires a cell tuple or x, y, z")
+            return validate_cell(x)  # type: ignore[arg-type]
+        if y is None or z is None:
+            raise WorldFormatError("cell lookup requires x, y, and z")
+        return validate_cell((x, y, z))  # type: ignore[arg-type]
+
+    def _api_axis(self, value: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("automation movement axes must be numeric") from exc
+        if not math.isfinite(number):
+            raise ValueError("automation movement axes must be finite")
+        return max(-1.0, min(1.0, number))
+
+    def _automation_input_active(self) -> bool:
+        return (
+            abs(self.automation_forward) > 1e-4
+            or abs(self.automation_right) > 1e-4
+            or abs(self.automation_vertical) > 1e-4
+            or self.automation_jump_requested
+        )
+
+    def _resolve_screenshot_path(self, path: str | Path | None) -> Path:
+        if path is None:
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            return self.paths.root / "screenshots" / f"neko_mouse_world-{stamp}-{time.time_ns() % 1_000_000_000:09d}.png"
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".png")
+        return target
+
     def _can_run_background_world_sync(self) -> bool:
         if not self._player_controls_enabled(self.world_load_job is not None):
             return True
@@ -1236,6 +1537,8 @@ class NekoMouseWorldApp(ShowBase):
     def _player_input_is_idle(self) -> bool:
         if any(self.key_state.values()):
             return False
+        if self._automation_input_active():
+            return False
         if self.move_mode == "walk" and (not self.grounded or abs(self.vertical_velocity) > 1e-4):
             return False
         return globalClock.getFrameTime() - self.last_player_input_time >= PLAYER_INPUT_IDLE_SYNC_DELAY
@@ -1247,23 +1550,41 @@ class NekoMouseWorldApp(ShowBase):
         right = Vec3(math.cos(heading_rad), math.sin(heading_rad), 0)
         desired = Vec3(0, 0, 0)
 
-        if allow_input and self.key_state["forward"]:
-            desired += forward
-        if allow_input and self.key_state["back"]:
-            desired -= forward
-        if allow_input and self.key_state["right"]:
-            desired += right
-        if allow_input and self.key_state["left"]:
-            desired -= right
-        if desired.lengthSquared() > 0:
-            desired.normalize()
-            desired *= MOVE_SPEED * dt
+        forward_axis = 0.0
+        right_axis = 0.0
+        vertical_axis = 0.0
+        jump_requested = self.automation_jump_requested
+        self.automation_jump_requested = False
+        if allow_input:
+            if self.human_input_enabled:
+                if self.key_state["forward"]:
+                    forward_axis += 1.0
+                if self.key_state["back"]:
+                    forward_axis -= 1.0
+                if self.key_state["right"]:
+                    right_axis += 1.0
+                if self.key_state["left"]:
+                    right_axis -= 1.0
+                if self.key_state["up"]:
+                    vertical_axis += 1.0
+                if self.key_state["down"]:
+                    vertical_axis -= 1.0
+            forward_axis += self.automation_forward
+            right_axis += self.automation_right
+            vertical_axis += self.automation_vertical
+
+        horizontal = forward * forward_axis + right * right_axis
+        horizontal_length = horizontal.length()
+        if horizontal_length > 1.0:
+            horizontal /= horizontal_length
+        if horizontal.lengthSquared() > 0:
+            desired += horizontal * MOVE_SPEED * dt
+        if allow_input and jump_requested and self.move_mode == "walk" and self._can_jump_from_current_position():
+            self.vertical_velocity = JUMP_SPEED
+            self.grounded = False
 
         if self.move_mode == "fly":
-            if allow_input and self.key_state["up"]:
-                desired.z += FLY_VERTICAL_SPEED * dt
-            if allow_input and self.key_state["down"]:
-                desired.z -= FLY_VERTICAL_SPEED * dt
+            desired.z += max(-1.0, min(1.0, vertical_axis)) * FLY_VERTICAL_SPEED * dt
             self.vertical_velocity = 0.0
             self.grounded = False
         else:
@@ -1636,6 +1957,8 @@ class NekoMouseWorldApp(ShowBase):
         return False
 
     def _right_click(self) -> None:
+        if not self.human_input_enabled:
+            return
         self._mark_player_input_active()
         if self.modal_mode == "focus_pause":
             return
@@ -1671,6 +1994,8 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status(f"Placed {target} orientation={self.selected_orientation}")
 
     def _delete_clicked_box(self) -> None:
+        if not self.human_input_enabled:
+            return
         self._mark_player_input_active()
         if self.modal_mode == "focus_pause":
             return
@@ -1700,6 +2025,8 @@ class NekoMouseWorldApp(ShowBase):
             self._remove_world_box(cell)
 
     def _pick_clicked_box(self) -> None:
+        if not self.human_input_enabled:
+            return
         self._mark_player_input_active()
         if self.modal_mode == "focus_pause":
             return
@@ -1730,6 +2057,8 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status(f"Selected {digest[:12]} orientation={self.selected_orientation}")
 
     def _rotate_target_box(self, command: str) -> None:
+        if not self.human_input_enabled:
+            return
         self._mark_player_input_active()
         if self.modal_mode == "focus_pause":
             return
@@ -1770,6 +2099,8 @@ class NekoMouseWorldApp(ShowBase):
         self._rotate_target_box(command)
 
     def _directional_key_pressed(self, direction: str) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.modal_mode == "quit":
@@ -1793,6 +2124,8 @@ class NekoMouseWorldApp(ShowBase):
         return axis, turns
 
     def _edit_target_box(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.world_load_job is not None:
@@ -1921,6 +2254,8 @@ class NekoMouseWorldApp(ShowBase):
             self.set_mouse_capture(self.editor_restore_mouse_capture)
 
     def _look_at_world_focus(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.world_load_job is not None:
@@ -1955,6 +2290,8 @@ class NekoMouseWorldApp(ShowBase):
         self.pitch = max(-89.0, min(89.0, math.degrees(math.atan2(direction.z, horizontal))))
 
     def _toggle_move_mode(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.world_load_job is not None:
@@ -1969,6 +2306,8 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status(f"Movement: {self.move_mode}")
 
     def _toggle_view(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.world_load_job is not None:
@@ -2528,6 +2867,8 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status(f"Deleted {cell}")
 
     def _restore_last_deleted_box(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "editor_wait":
             self._focus_editor_if_waiting()
             return
@@ -2968,6 +3309,8 @@ class NekoMouseWorldApp(ShowBase):
             self.ground_chunks[key] = node
 
     def _open_help(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode == "focus_pause":
             return
         if self.ui_open:
@@ -3011,6 +3354,7 @@ class NekoMouseWorldApp(ShowBase):
                     "Alpha 0 in .box: opaque RGB light source",
                     "F2 or Ctrl+S: show save status",
                     "F5: switch first / third person",
+                    "F12: save a screenshot",
                     "C: look at box centroid / origin if empty",
                     "~: server console; Enter/Send sends command",
                     "Console input wraps up to 4096 chars",
@@ -3024,11 +3368,11 @@ class NekoMouseWorldApp(ShowBase):
             ),
             text_fg=(0.92, 0.94, 0.96, 1),
             text_align=0,
-            text_scale=0.033,
+            text_scale=0.030,
             frameColor=(0, 0, 0, 0),
             pos=(-0.58, 0, 0.36),
         )
-        self._panel_button("OK", (0, 0, -0.52), self._close_help)
+        self._panel_button("OK", (0, 0, -0.58), self._close_help)
         self._set_status("Help")
 
     def _panel_button(self, text: str, pos: tuple[float, float, float], command: Callable[[], None]) -> DirectButton:
@@ -3303,6 +3647,8 @@ class NekoMouseWorldApp(ShowBase):
         raise SystemExit
 
     def _open_console(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.ui_open or self.modal_mode is not None or self.world_load_job is not None:
             return
         if self.network_client is None:
@@ -3991,6 +4337,8 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status("Ready")
 
     def _release_mouse_capture(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.modal_mode in {"kicked", "connect_refused", "version_mismatch"}:
             self._quit_after_kick()
             return
@@ -4017,6 +4365,8 @@ class NekoMouseWorldApp(ShowBase):
 
     def set_mouse_capture(self, captured: bool) -> None:
         if captured and self.world_load_job is not None:
+            captured = False
+        if captured and not self.human_input_enabled:
             captured = False
         if captured and not self._window_has_foreground():
             captured = False
@@ -4050,6 +4400,8 @@ class NekoMouseWorldApp(ShowBase):
             self._sync_camera_aspect()
             self._position_focus_pause_panel()
             self.ime_disabled = disable_ime_for_window(self.win) or self.ime_disabled
+            if not self.human_input_enabled:
+                return
             if self.world_load_job is not None:
                 return
             if self.modal_mode != "quit" and not self._window_has_foreground():
@@ -4063,6 +4415,8 @@ class NekoMouseWorldApp(ShowBase):
         self.camLens.setAspectRatio(width / height)
 
     def _check_foreground_pause(self) -> None:
+        if not self.human_input_enabled:
+            return
         if self.world_load_job is not None:
             return
         if self.modal_mode in {
@@ -4305,6 +4659,11 @@ class NekoMouseWorldApp(ShowBase):
         self.saved_snapshot = self._current_world_snapshot()
         if not quiet:
             self._set_status(f"Saved {self.paths.info_file}")
+
+    def _save_current_key(self) -> None:
+        if not self.human_input_enabled:
+            return
+        self.save_current()
 
 
 def make_checker_ground_patch(origin_x: int, origin_y: int, size: int) -> NodePath:

@@ -173,6 +173,7 @@ is transparent, and alpha `255` is opaque.
 - Numpad `8` / `2`: rotate the targeted box around the player's view direction axis.
 - `F2` or `Ctrl+S`: show save status; multiplayer worlds are saved by the server.
 - `F5`: switch first-person / third-person view.
+- `F12`: save a screenshot under the world's `screenshots/` directory.
 - `C`: look at the world-box centroid, or the origin when the world is empty.
 - `~`: open the server command console.
 - `H`: show help.
@@ -183,6 +184,7 @@ modal window is open. Type a command in the bottom input and press `Enter` or
 click `Send` to send it to the server. Close the console with its top-right `X`
 button or `Esc`. See [Server Command Console](docs/server-command-console.md)
 for permissions, server logs, environment variables, and the command reference.
+For Python automation scripts, see the [Client Developer API](docs/client-developer-api.md).
 
 Placing, deleting, selecting, editing, and hover highlighting only work within
 10 world units of the player.

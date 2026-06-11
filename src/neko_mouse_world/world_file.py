@@ -15,7 +15,6 @@ Cell = tuple[int, int, int]
 PlayerPosition = tuple[float, float, float]
 
 WORLD_SCHEMA_VERSION = 3
-SUPPORTED_WORLD_SCHEMA_VERSIONS = {2, 3}
 WORLD_FILE_NAME = "info.world"
 BOXES_DIR_NAME = "boxes"
 
@@ -197,8 +196,10 @@ def _load_world_from_connection(connection: sqlite3.Connection, path: Path) -> t
     tables = _table_names(connection)
     _require_tables(tables, {"metadata"}, path)
     schema_version = _read_schema_version(connection, path)
-    if schema_version not in SUPPORTED_WORLD_SCHEMA_VERSIONS:
-        raise WorldFormatError(f"{path} uses unsupported info.world schema version {schema_version}")
+    if schema_version != WORLD_SCHEMA_VERSION:
+        raise WorldFormatError(
+            f"{path} uses info.world schema version {schema_version}; expected {WORLD_SCHEMA_VERSION}"
+        )
     _require_tables(tables, {"boxes"}, path)
 
     boxes: dict[Cell, str] = {}
@@ -209,18 +210,15 @@ def _load_world_from_connection(connection: sqlite3.Connection, path: Path) -> t
         cell = validate_cell((row["x"], row["y"], row["z"]))
         boxes[cell] = validate_digest(row["hash"])
         orientations[cell] = validate_world_orientation(row["orientation"])
-    player_positions = _load_player_positions(connection, tables, schema_version, path)
+    player_positions = _load_player_positions(connection, tables, path)
     return WorldMap(boxes=boxes, orientations=orientations), player_positions
 
 
 def _load_player_positions(
     connection: sqlite3.Connection,
     tables: set[str],
-    schema_version: int,
     path: Path,
 ) -> dict[str, PlayerPosition]:
-    if schema_version < 3:
-        return {}
     _require_tables(tables, {"player_positions"}, path)
     _require_columns(connection, "player_positions", {"user_id", "x", "y", "z"}, path)
     rows = connection.execute("SELECT user_id, x, y, z FROM player_positions ORDER BY user_id").fetchall()

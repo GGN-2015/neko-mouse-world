@@ -31,6 +31,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def create_client_app(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, user_id: str = "") -> NekoMouseWorldApp:
+    """Create a networked client app for developer automation scripts.
+
+    The caller owns the returned app and should call app.run(). When finished,
+    close app.network_client if it is still present.
+    """
+    desired_user_id = _user_id_argument(user_id)
+    network_client = NetworkWorldClient(host, int(port), desired_user_id=desired_user_id)
+    loaded_world = LoadedWorld(paths=network_client.paths, world_map=network_client.world_map)
+    return NekoMouseWorldApp(loaded_world, network_client=network_client)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(raw_args)
