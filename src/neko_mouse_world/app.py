@@ -256,6 +256,9 @@ class NekoMouseWorldApp(ShowBase):
         self.held_item_model: NodePath | None = None
         self.held_item_key: tuple[str, int] | None = None
         self.held_item_visible = False
+        self.third_person_held_anchor: NodePath | None = None
+        self.third_person_held_model: NodePath | None = None
+        self.third_person_held_key: tuple[str, int] | None = None
         self.view_mode = "first"
         self.move_mode = "walk"
         self.vertical_velocity = 0.0
@@ -390,6 +393,10 @@ class NekoMouseWorldApp(ShowBase):
         self._add_player_part("left-leg", (0.20, 0.24, 0.78), (-0.13, 0, 0.39), (0.12, 0.18, 0.42, 1))
         self._add_player_part("right-leg", (0.20, 0.24, 0.78), (0.13, 0, 0.39), (0.12, 0.18, 0.42, 1))
         self.player_model.setTransparency(TransparencyAttrib.MAlpha)
+        self.third_person_held_anchor = self.player_model.attachNewNode("third-person-held-anchor")
+        self.third_person_held_anchor.setPos(0.48, -0.14, 0.78)
+        self.third_person_held_anchor.setHpr(18, -12, -8)
+        self.third_person_held_anchor.hide()
         self.player_model.hide()
 
     def _add_player_part(
@@ -408,9 +415,9 @@ class NekoMouseWorldApp(ShowBase):
         self.held_item_root = self.camera.attachNewNode("held-item")
         self.held_item_root.setPos(0.76, 1.18, -0.58)
         self.held_item_root.setHpr(-18, -10, 6)
-        self.held_item_root.setBin("fixed", 20)
-        self.held_item_root.setDepthTest(False)
-        self.held_item_root.setDepthWrite(False)
+        self.held_item_root.setBin("fixed", 10)
+        self.held_item_root.setDepthTest(True)
+        self.held_item_root.setDepthWrite(True)
         self.held_item_root.hide()
         hand = make_cuboid("held-right-hand", (0.22, 0.30, 0.20))
         hand.reparentTo(self.held_item_root)
@@ -424,14 +431,10 @@ class NekoMouseWorldApp(ShowBase):
         sleeve.setColor(0.10, 0.34, 0.88, 1)
 
     def _refresh_held_item(self, force: bool = False) -> None:
+        self._refresh_third_person_held_item(force=force)
         if self.held_item_root is None:
             return
-        visible = bool(
-            self.permissions.get("allow_set", True)
-            and self.world_load_job is None
-            and self.modal_mode not in {"kicked", "connect_refused", "version_mismatch"}
-            and self.selected_hash
-        )
+        visible = self._local_held_item_visible()
         key = (self.selected_hash, self.selected_orientation) if visible else None
         if not force and visible == self.held_item_visible and key == self.held_item_key:
             return
@@ -456,9 +459,41 @@ class NekoMouseWorldApp(ShowBase):
         model.setPos(-0.02, 0.08, 0.12)
         model.setScale(0.42)
         model.setHpr(28, -24, 12)
-        model.setTwoSided(True)
+        model.setDepthTest(True)
         self.held_item_model = model
         self.held_item_root.show()
+
+    def _refresh_third_person_held_item(self, force: bool = False) -> None:
+        if self.third_person_held_anchor is None:
+            return
+        digest, orientation, held = self._current_held_item_state()
+        visible = bool(held and self.view_mode == "third")
+        key = (digest, orientation) if visible else None
+        if not force and key == self.third_person_held_key:
+            return
+        if self.third_person_held_model is not None:
+            self.third_person_held_model.removeNode()
+            self.third_person_held_model = None
+        self.third_person_held_key = key
+        if key is None:
+            self.third_person_held_anchor.hide()
+            return
+        try:
+            surface = self.surface_cache.get(key[0])
+            model = build_box_preview_mesh(surface, key[1], "third-person-held-box")
+        except (BoxFormatError, ValueError):
+            model = None
+        if model is None:
+            self.third_person_held_anchor.hide()
+            return
+        model.reparentTo(self.third_person_held_anchor)
+        model.setPos(0, 0, 0)
+        model.setScale(0.30)
+        model.setHpr(28, -24, 12)
+        model.setDepthTest(True)
+        model.show()
+        self.third_person_held_model = model
+        self.third_person_held_anchor.show()
 
     def _current_held_item_state(self) -> tuple[str, int, bool]:
         visible = bool(
@@ -469,6 +504,15 @@ class NekoMouseWorldApp(ShowBase):
         )
         digest = str(self.selected_hash or "") if visible else ""
         return digest, int(self.selected_orientation), visible
+
+    def _local_held_item_visible(self) -> bool:
+        return bool(
+            self.permissions.get("allow_set", True)
+            and self.view_mode == "first"
+            and self.world_load_job is None
+            and self.modal_mode not in {"kicked", "connect_refused", "version_mismatch"}
+            and self.selected_hash
+        )
 
     def _make_remote_player_render(self, player_id: int) -> _RemotePlayerRender:
         root = self.render.attachNewNode(f"remote-player-{player_id}")
@@ -999,7 +1043,7 @@ class NekoMouseWorldApp(ShowBase):
         model.setPos(0, 0, 0)
         model.setScale(0.30)
         model.setHpr(28, -24, 12)
-        model.setTwoSided(True)
+        model.setDepthTest(True)
         model.show()
         render.held_model = model
         render.held_anchor.show()
@@ -1823,6 +1867,7 @@ class NekoMouseWorldApp(ShowBase):
         if self.ui_open:
             return
         self.view_mode = "third" if self.view_mode == "first" else "first"
+        self._refresh_held_item(force=True)
         self._set_status(f"View: {self.view_mode}")
 
     def _update_hover_outline(self) -> None:

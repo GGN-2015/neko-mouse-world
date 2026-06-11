@@ -25,8 +25,10 @@ server log: permission denied, use pin('PIN-CONTENT') to retrive admin access.
 
 If your command permission is revoked while the console is open, the client
 immediately clears the old log view and replaces it with that line. A top-level
-`pin("secret")` command can still be sent without command permission when the
-server was started with `--pin`.
+`pin("secret")` command can still be sent without command permission. If the
+server was started without `--pin`, it generated a random nine-digit PIN and
+printed `Random Pin: <pin>` to the server process stdout only; that line is not
+visible in this in-game log view.
 
 ## Commands
 
@@ -70,12 +72,14 @@ ignore(setenv("mode", {"fly": true}), getenv("mode"))
   disabled, the target client immediately returns to walk mode.
 - `allow_break(user_id, true/false)`: allow or deny breaking boxes.
 - `allow_cmd(user_id, true/false)`: allow or deny using server commands.
-- `pin(secret)`: if the server was started with `--pin secret` and the value
-  matches, enable commands for your own player. A top-level `pin(...)` call is
-  the only command accepted when your current `allow_cmd` permission is false.
-  Running `pin(...)` while already allowed is harmless; a wrong secret does not
-  remove existing command permission. The submitted secret is redacted from
-  server stdout, stderr, and the in-game log.
+- `pin(secret)`: if the value matches the server PIN, enable commands for your
+  own player. The PIN is either the explicit `--pin secret` value or, when
+  `--pin` is omitted, the random nine-digit decimal value printed as
+  `Random Pin: <pin>` to the server process stdout only. A top-level `pin(...)`
+  call is the only command accepted when your current `allow_cmd` permission is
+  false. Running `pin(...)` while already allowed is harmless; a wrong secret
+  does not remove existing command permission. The submitted secret is redacted
+  from server stdout, stderr, and the in-game log.
 - `ignore(*args)`: evaluate any number of arguments and always return `None`.
   This is useful when you want side effects from nested commands without logging
   a returned value.

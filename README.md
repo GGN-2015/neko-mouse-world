@@ -73,9 +73,12 @@ over TCP. World/map changes always use TCP. Player positions first try UDP; the
 client sends 5 probe packets and UDP is used only when at least 3 probes succeed.
 If the test fails, player positions automatically fall back to TCP.
 
-The server also accepts `--pin <secret>`. Any connected client may run a
-top-level `pin("secret")` from the server console, even when command permission
-is currently disabled for that player; this is the only command allowed without
+The server accepts `--pin <secret>` for command-console admin access. If
+`--pin` is omitted, the server generates a random nine-digit decimal PIN and
+prints `Random Pin: <pin>` to the server process stdout only; that line is not
+captured into the in-game server log. Any connected client may run a top-level
+`pin("secret")` from the server console, even when command permission is
+currently disabled for that player; this is the only command allowed without
 `allow_cmd`. When it matches, the server grants that player
 `allow_cmd(..., true)`. Running `pin(...)` while already allowed is harmless, and
 a wrong secret does not remove existing command permission. Submitted pin values

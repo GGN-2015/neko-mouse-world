@@ -54,6 +54,9 @@ UDP_PROBE_THRESHOLD = 3
 DEFAULT_STARTUP_ASSET_CHANNELS = 4
 SERVER_LOG_LIMIT = 300
 PLAYER_SPAWN_HEIGHT = 1.8
+STDOUT_ONLY_MARKER = "\x1eNEKO_MOUSE_WORLD_STDOUT_ONLY\x1e"
+TCP_HEARTBEAT_INTERVAL = 5.0
+UDP_RESET_PROBE_INTERVAL = 1.0
 DEFAULT_PERMISSION_ENV = {
     "allow_set": "DEFAULT_SET",
     "allow_fly": "DEFAULT_FLY",
@@ -188,12 +191,30 @@ def _print_traceback(context: str) -> None:
         pass
 
 
+def _generate_random_pin() -> str:
+    return f"{secrets.randbelow(900_000_000) + 100_000_000:09d}"
+
+
+def _print_stdout_only(text: str) -> None:
+    try:
+        sys.stdout.write(f"{STDOUT_ONLY_MARKER}{text}\n")
+        sys.stdout.flush()
+    except BaseException:
+        pass
+
+
+def _is_udp_peer_reset_error(exc: OSError) -> bool:
+    code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+    return isinstance(exc, ConnectionResetError) or code == 10054
+
+
 @dataclass
 class ClientConnection:
     player_id: int
     user_id: str
     client_uuid: str
     writer: BinaryIO
+    endpoint: str = "unknown:0"
     lock: threading.Lock = field(default_factory=threading.Lock)
     startup_token: str = field(default_factory=lambda: secrets.token_hex(16))
     startup_asset_hashes: set[str] = field(default_factory=set)
@@ -202,6 +223,7 @@ class ClientConnection:
     udp_enabled: bool = False
     udp_probe_seen: set[int] = field(default_factory=set)
     kicked: bool = False
+    logout_logged: bool = False
     permissions: ClientPermissions = field(default_factory=ClientPermissions)
     spawn_pos: PlayerPosition = (0.5, -4.0, 0.0)
     loaded: bool = False
@@ -232,6 +254,7 @@ class WorldServerState:
         self.accepting_clients = True
         self.stop_requested = threading.Event()
         self.server: socketserver.BaseServer | None = None
+        self.last_udp_reset_probe = 0.0
 
     def configure_udp(self, host: str, port: int) -> None:
         with self.lock:
@@ -258,7 +281,13 @@ class WorldServerState:
     def client_config_message(self) -> dict[str, Any]:
         return {"type": "client_config", **self.client_config()}
 
-    def register(self, writer: BinaryIO, client_uuid: str, desired_user_id: str = "") -> ClientConnection:
+    def register(
+        self,
+        writer: BinaryIO,
+        client_uuid: str,
+        desired_user_id: str = "",
+        endpoint: str = "unknown:0",
+    ) -> ClientConnection:
         with self.lock:
             if not self.accepting_clients:
                 raise ConnectionError("server is stopping")
@@ -270,6 +299,7 @@ class WorldServerState:
                 user_id=user_id,
                 client_uuid=client_uuid,
                 writer=writer,
+                endpoint=endpoint,
                 permissions=ClientPermissions.from_environment(),
                 spawn_pos=self._spawn_position_for_user(user_id),
             )
@@ -317,23 +347,76 @@ class WorldServerState:
     def unregister(self, client: ClientConnection) -> None:
         try:
             should_cleanup = False
+            log_logout = False
+            removed = False
             with self.lock:
+                if self.clients.get(client.player_id) is not client:
+                    return
                 self._persist_client_position(client)
                 self.clients.pop(client.player_id, None)
                 self.player_states.pop(client.player_id, None)
                 self._save()
+                removed = True
+                if not client.logout_logged:
+                    client.logout_logged = True
+                    log_logout = True
                 should_cleanup = not self.clients and not self.stop_requested.is_set()
+            if log_logout:
+                self.log(f"CLIENT LOGOUT: {client.endpoint}:{client.user_id}")
             try:
                 client.writer.close()
             except OSError:
                 pass
             except Exception:
                 _print_traceback(f"failed to close writer for player {client.player_id}")
-            self.broadcast({"type": "player_left", "player_id": client.player_id}, exclude=client.player_id)
+            if removed:
+                self.broadcast({"type": "player_left", "player_id": client.player_id}, exclude=client.player_id)
             if should_cleanup:
                 self._cleanup_unused_boxes()
         except Exception:
             _print_traceback(f"failed to unregister player {client.player_id}")
+
+    def start_client_heartbeat(self, client: ClientConnection, stop_event: threading.Event) -> threading.Thread:
+        thread = threading.Thread(
+            target=self._client_heartbeat_loop,
+            args=(client, stop_event),
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _client_heartbeat_loop(self, client: ClientConnection, stop_event: threading.Event) -> None:
+        while not stop_event.wait(TCP_HEARTBEAT_INTERVAL):
+            if not self._send_client_heartbeat(client):
+                return
+
+    def _send_client_heartbeat(self, client: ClientConnection) -> bool:
+        with self.lock:
+            if self.clients.get(client.player_id) is not client or self.stop_requested.is_set():
+                return False
+        try:
+            client.send({"type": "server_ping"})
+            return True
+        except OSError:
+            self.unregister(client)
+            return False
+        except Exception:
+            _print_traceback(f"failed to heartbeat player {client.player_id}")
+            self.unregister(client)
+            return False
+
+    def probe_clients_after_udp_reset(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if now - self.last_udp_reset_probe < UDP_RESET_PROBE_INTERVAL:
+                return
+            self.last_udp_reset_probe = now
+            clients = list(self.clients.values())
+        threading.Thread(target=self._probe_clients_after_udp_reset, args=(clients,), daemon=True).start()
+
+    def _probe_clients_after_udp_reset(self, clients: list[ClientConnection]) -> None:
+        for client in clients:
+            self._send_client_heartbeat(client)
 
     def welcome_message(self, player_id: int, include_assets: bool = False) -> dict[str, Any]:
         with self.lock:
@@ -1495,6 +1578,13 @@ class _ServerStreamTee:
 
     def write(self, text: str) -> int:
         with self._lock:
+            text = str(text)
+            written = len(text)
+            if self.stream == "stdout" and STDOUT_ONLY_MARKER in text:
+                combined = self._buffer + text
+                self._buffer = ""
+                self._write_stdout_only_split(combined)
+                return written
             written = self.wrapped.write(text)
             self.wrapped.flush()
             self._buffer += text
@@ -1503,6 +1593,31 @@ class _ServerStreamTee:
                 self._buffer = rest
                 self.state._record_log_line(line, self.stream)
             return written
+
+    def _write_stdout_only_split(self, text: str) -> None:
+        while STDOUT_ONLY_MARKER in text:
+            before, _, after = text.partition(STDOUT_ONLY_MARKER)
+            if before:
+                self._write_and_capture(before)
+            line, newline, rest = after.partition("\n")
+            self.wrapped.write(line + newline)
+            self.wrapped.flush()
+            text = rest
+        if text:
+            self._buffer += text
+            while "\n" in self._buffer:
+                line, _, rest = self._buffer.partition("\n")
+                self._buffer = rest
+                self._write_and_capture(line + "\n")
+
+    def _write_and_capture(self, text: str) -> None:
+        self.wrapped.write(text)
+        self.wrapped.flush()
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, _, rest = self._buffer.partition("\n")
+            self._buffer = rest
+            self.state._record_log_line(line, self.stream)
 
     def flush(self) -> None:
         with self._lock:
@@ -1540,9 +1655,12 @@ class _UdpLoop(threading.Thread):
                     self.state.handle_udp_message(message, address, self.socket)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as exc:
                 if self._stopped.is_set():
                     break
+                if _is_udp_peer_reset_error(exc):
+                    self.state.probe_clients_after_udp_reset()
+                    continue
                 _print_traceback("udp socket error")
                 time.sleep(0.1)
             except ValueError:
@@ -1585,6 +1703,8 @@ class _Handler(socketserver.StreamRequestHandler):
         state: WorldServerState = self.server.state  # type: ignore[attr-defined]
         client: ClientConnection | None = None
         endpoint = self._client_endpoint()
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
         try:
             first = read_message(self.rfile)
             if first is not None and first.get("type") == "asset_stream":
@@ -1612,10 +1732,11 @@ class _Handler(socketserver.StreamRequestHandler):
                     },
                 )
                 return
-            client = state.register(self.wfile, client_uuid, desired_user_id)
+            client = state.register(self.wfile, client_uuid, desired_user_id, endpoint)
             state.log(f"CLIENT LOGIN: {endpoint}:{client.user_id}")
             include_assets = bool((first or {}).get("include_assets", False))
             client.send(state.welcome_message(client.player_id, include_assets=include_assets))
+            heartbeat_thread = state.start_client_heartbeat(client, heartbeat_stop)
             state.broadcast({"type": "player_join", "player_id": client.player_id}, exclude=client.player_id)
             while True:
                 message = read_message(self.rfile)
@@ -1627,12 +1748,17 @@ class _Handler(socketserver.StreamRequestHandler):
         except Exception:
             _print_traceback("tcp client handler failed")
         finally:
+            heartbeat_stop.set()
             if client is not None:
                 try:
-                    state.log(f"CLIENT LOGOUT: {endpoint}:{client.user_id}")
                     state.unregister(client)
                 except Exception:
                     _print_traceback("failed during client unregister")
+            if heartbeat_thread is not None:
+                try:
+                    heartbeat_thread.join(timeout=0.2)
+                except Exception:
+                    _print_traceback("failed joining client heartbeat")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1642,7 +1768,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="TCP port to bind")
     parser.add_argument("--udp-host", default=None, help="UDP host/interface to bind; defaults to --host")
     parser.add_argument("--udp-port", default=0, type=int, help="UDP port to bind; 0 auto-allocates")
-    parser.add_argument("--pin", default="", help="server command unlock secret; never written to server logs")
+    parser.add_argument("--pin", default=None, help="server command unlock secret; never written to server logs")
     parser.add_argument(
         "--startup-asset-channels",
         default=DEFAULT_STARTUP_ASSET_CHANNELS,
@@ -1667,7 +1793,12 @@ def main(argv: list[str] | None = None) -> int:
     sys.stderr = _ServerStreamTee(state, original_stderr, "stderr")  # type: ignore[assignment]
     state.stdout_capture_active = True
     state.configure_startup_asset_channels(args.startup_asset_channels)
-    state.configure_pin(args.pin)
+    if args.pin is None:
+        generated_pin = _generate_random_pin()
+        state.configure_pin(generated_pin)
+        _print_stdout_only(f"Random Pin: {generated_pin}")
+    else:
+        state.configure_pin(args.pin)
 
     try:
         udp_host = args.udp_host or args.host

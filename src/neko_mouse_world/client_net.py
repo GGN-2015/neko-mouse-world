@@ -576,6 +576,8 @@ class NetworkWorldClient:
         elif message_type == "force_move_mode":
             self.incoming.put({"type": "force_move_mode", "move_mode": str(message.get("move_mode", "walk"))})
             return
+        elif message_type == "server_ping":
+            return
         elif message_type == "player_left":
             try:
                 with self._remote_lock:
