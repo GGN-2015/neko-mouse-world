@@ -33,6 +33,7 @@ from neko_mouse_world.world_file import Cell, WorldFormatError, validate_cell  #
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 DEFAULT_USER_ID = "ai-agent"
+DEFAULT_MAX_FILL_VOLUME = 4096
 ZH_NO_RESPONSE = (
     "\u6a21\u578b\u8fd9\u8f6e\u6ca1\u6709\u8fd4\u56de\u6587\u672c\u6216\u5de5\u5177\u8c03\u7528\uff0c"
     "\u6240\u4ee5\u6211\u6ca1\u6709\u6267\u884c\u52a8\u4f5c\u3002"
@@ -58,6 +59,8 @@ You are not only a block placer. You are a conversational builder:
   movement, camera, screenshots, and world editing.
 - For building, prefer direct world-editing tools and fill_region for bulk cuboids.
   Use create_box_asset when a color or reusable block style is needed.
+- Never ask fill_region to change more than 4096 world boxes in one call. Split
+  larger builds into multiple smaller fill_region calls.
 - For navigation, prefer move_to or move_for plus set_look/look_at_cell.
 - Coordinates are integer world cells. Player positions are floating point.
 - If a request is ambiguous, discuss the design choice briefly instead of silently
@@ -84,7 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout", default=60.0, type=float, help="Responses request timeout in seconds")
     parser.add_argument("--request-retries", default=2, type=int, help="Responses retries after transient failures")
     parser.add_argument("--max-tool-steps", default=24, type=int, help="maximum tool-call rounds per instruction")
-    parser.add_argument("--max-fill-volume", default=4096, type=int, help="maximum boxes changed by one fill_region call")
+    parser.add_argument(
+        "--max-fill-volume",
+        default=DEFAULT_MAX_FILL_VOLUME,
+        type=int,
+        help="maximum boxes changed by one fill_region call",
+    )
     parser.add_argument("--screenshot-detail", choices=("low", "high", "auto"), default="high")
     return parser
 
