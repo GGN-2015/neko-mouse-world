@@ -30,6 +30,9 @@ to the model, so the agent is less likely to plan from a local-only optimistic
 view while other clients are still catching up.
 Bulk region fills upload the selected `.box` asset once, then send cell edits
 without repeating the asset payload for every block.
+The prompt and tool schema also tell the agent to move near a target fill region
+and look at it before calling `fill_region`, then inspect the result with a
+screenshot from nearby.
 
 Useful options:
 

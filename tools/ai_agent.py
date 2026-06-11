@@ -61,6 +61,9 @@ You are not only a block placer. You are a conversational builder:
   Use create_box_asset when a color or reusable block style is needed.
 - Never ask fill_region to change more than 4096 world boxes in one call. Split
   larger builds into multiple smaller fill_region calls.
+- Before every fill_region call, move near the target region and look at it.
+  Prefer move_near_region for this; otherwise use move_to and look_at_cell.
+  After filling, capture_view and inspect the result from nearby.
 - For navigation, prefer move_to or move_for plus set_look/look_at_cell.
 - Coordinates are integer world cells. Player positions are floating point.
 - If a request is ambiguous, discuss the design choice briefly instead of silently
@@ -325,6 +328,7 @@ class ClientTools:
                 "set_movement": self.set_movement,
                 "move_for": self.move_for,
                 "move_to": self.move_to,
+                "move_near_region": self.move_near_region,
                 "stop_movement": self.stop_movement,
                 "jump": self.jump,
             }
@@ -752,6 +756,47 @@ class ClientTools:
         pose = self.observe({"radius": 8, "limit": 60}, generation, is_current).get("pose")
         return {"ok": arrived and not interrupted, "arrived": arrived, "interrupted": interrupted, "target": target_pos, "pose": pose}
 
+    def move_near_region(self, arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
+        min_cell = self._world_cell(arguments.get("min_cell"))
+        max_cell = self._world_cell(arguments.get("max_cell"))
+        distance = max(2.0, min(24.0, float(arguments.get("distance", 8.0))))
+        timeout = max(1.0, min(60.0, float(arguments.get("timeout", 18.0))))
+        fly = bool(arguments.get("fly", False))
+        x0, x1 = sorted((min_cell[0], max_cell[0]))
+        y0, y1 = sorted((min_cell[1], max_cell[1]))
+        z0, z1 = sorted((min_cell[2], max_cell[2]))
+        center = ((x0 + x1) / 2.0 + 0.5, (y0 + y1) / 2.0 + 0.5, (z0 + z1) / 2.0 + 0.5)
+
+        def choose_target() -> JsonObject:
+            px, py, _pz = self.app.get_player_position()
+            dx = px - center[0]
+            dy = py - center[1]
+            length = math.hypot(dx, dy)
+            if length < 0.001:
+                dx, dy, length = 1.0, -1.0, math.sqrt(2.0)
+            tx = center[0] + dx / length * distance
+            ty = center[1] + dy / length * distance
+            tz = max(0.0, center[2])
+            return {"ok": True, "target": [tx, ty, tz], "center_cell": [round(center[0] - 0.5), round(center[1] - 0.5), round(center[2] - 0.5)]}
+
+        target_result = self._call_current(generation, is_current, choose_target)
+        if not target_result.get("ok"):
+            return target_result
+        move_result = self.move_to(
+            {"position": target_result["target"], "fly": fly, "tolerance": 1.25, "timeout": timeout},
+            generation,
+            is_current,
+        )
+        look_result = self.look_at_cell({"cell": target_result["center_cell"]}, generation, is_current)
+        return {
+            "ok": bool(move_result.get("ok")) and bool(look_result.get("ok")),
+            "region": {"min_cell": min_cell, "max_cell": max_cell},
+            "target": target_result["target"],
+            "look_at": target_result["center_cell"],
+            "move": move_result,
+            "look": look_result,
+        }
+
     def stop_movement(self, _arguments: JsonObject, generation: int, is_current: Callable[[int], bool]) -> JsonObject:
         def op() -> JsonObject:
             self.app.stop_automation_movement()
@@ -837,7 +882,7 @@ def response_tools() -> list[JsonObject]:
         tool("delete_box", "Delete one world box at an integer cell.", {"cell": cell_schema}, ["cell"]),
         tool(
             "fill_region",
-            "Place or delete boxes in an inclusive cuboid world region.",
+            "Place or delete boxes in an inclusive cuboid world region. Before calling this, move near the region and look at it.",
             {"min_cell": cell_schema, "max_cell": cell_schema, "mode": {"type": "string", "enum": ["place", "delete"]}, "hash": {"type": "string"}, "orientation": {"type": "integer", "minimum": 0, "maximum": 23}},
             ["min_cell", "max_cell"],
         ),
@@ -847,6 +892,12 @@ def response_tools() -> list[JsonObject]:
         tool("set_movement", "Set continuous automation movement axes, each clamped to -1..1.", {"forward": {"type": "number"}, "right": {"type": "number"}, "vertical": {"type": "number"}}),
         tool("move_for", "Move with automation axes for a bounded number of seconds, then stop.", {"forward": {"type": "number"}, "right": {"type": "number"}, "vertical": {"type": "number"}, "seconds": {"type": "number", "minimum": 0, "maximum": 30}}),
         tool("move_to", "Move toward a target world position or cell, optionally using fly mode.", {"position": cell_schema, "cell": cell_schema, "fly": {"type": "boolean"}, "tolerance": {"type": "number"}, "timeout": {"type": "number"}}),
+        tool(
+            "move_near_region",
+            "Move near an inclusive cuboid region and look at its center before inspecting or filling it.",
+            {"min_cell": cell_schema, "max_cell": cell_schema, "distance": {"type": "number"}, "fly": {"type": "boolean"}, "timeout": {"type": "number"}},
+            ["min_cell", "max_cell"],
+        ),
         tool("stop_movement", "Stop all automation movement immediately.", {}),
         tool("jump", "Request one walk-mode jump.", {}),
     ]
