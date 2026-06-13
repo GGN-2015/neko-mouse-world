@@ -4290,7 +4290,7 @@ class NekoMouseWorldApp(ShowBase):
         self._set_status("Ready")
 
     def _open_focus_pause(self) -> None:
-        if self.modal_mode in {"editor_wait", "quit", "console", "kicked", "connect_refused", "version_mismatch"}:
+        if self.modal_mode in {"editor_wait", "quit", "console", "connect", "kicked", "connect_refused", "version_mismatch"}:
             return
         if self.modal_mode == "focus_pause":
             self._position_focus_pause_panel()
@@ -4391,7 +4391,6 @@ class NekoMouseWorldApp(ShowBase):
             self._close_console()
             return
         if self.modal_mode == "connect":
-            self._request_quit()
             return
         self._open_quit_confirm()
 
@@ -4436,7 +4435,16 @@ class NekoMouseWorldApp(ShowBase):
                 return
             if self.world_load_job is not None:
                 return
-            if self.modal_mode != "quit" and not self._window_has_foreground():
+            if self.modal_mode not in {
+                "editor_wait",
+                "quit",
+                "help",
+                "console",
+                "connect",
+                "kicked",
+                "connect_refused",
+                "version_mismatch",
+            } and not self._window_has_foreground():
                 self._open_focus_pause()
 
     def _sync_camera_aspect(self) -> None:
