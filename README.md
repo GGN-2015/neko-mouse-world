@@ -36,6 +36,11 @@ venv\Scripts\python.exe tools\generate_castle_showcase.py
 venv\Scripts\python.exe tools\capture_showcase_screenshots.py
 ```
 
+## Single-File Executable Builds
+
+See [Single-File Executable Builds](docs/executable-builds.md) for the Windows
+server/client and Linux server packaging scripts, options, and release notes.
+
 ## Run
 
 Use the project virtual environment:

@@ -1899,17 +1899,7 @@ def _run_with_main_client(
     server_thread = threading.Thread(target=serve_until_shutdown, daemon=True)
     server_thread.start()
     client_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
-    command = [
-        sys.executable,
-        "-m",
-        "neko_mouse_world.client",
-        "--host",
-        client_host,
-        "--port",
-        str(port),
-        "--user-id",
-        "root",
-    ]
+    command = _main_client_command(client_host, port)
     server.state.log(f"Launching main client on {client_host}:{port}")
     try:
         try:
@@ -1940,6 +1930,22 @@ def _run_with_main_client(
         except BaseException:
             _print_traceback("server thread join failed")
     return int(return_code)
+
+
+def _main_client_command(host: str, port: int) -> list[str]:
+    client_args = [
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--user-id",
+        "root",
+    ]
+    if getattr(sys, "frozen", False):
+        adjacent_client = Path(sys.executable).with_name("neko-mouse-world-client.exe")
+        if adjacent_client.is_file():
+            return [str(adjacent_client), *client_args]
+    return [sys.executable, "-m", "neko_mouse_world.client", *client_args]
 
 
 if __name__ == "__main__":
